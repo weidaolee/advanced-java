@@ -1,0 +1,172 @@
+#+TITLE: 互斥鎖
+前面我們提到了 Java 內存模型提供了 happens-before 規則約束了 CPU 何時可以使用 cache, 以及 compiler 何時可以進行指令重排優化, 解決了可見性問題與有序性問題, 而原子性問題, 則需要靠互斥鎖來解決。原子性的根本問題是線程切換導致的, 而互斥鎖會在代碼中規劃出一個 *臨界區*, 使得 *在該臨界區內僅允許一個線程在執行, 且執行過程中不切換線程* 。 在 Java 中, 我們透過 synchronized 來控制上鎖與釋放鎖, 具體來說是 compiler 幫我們作到的。
+* 極簡鎖模型
+最基礎的鎖模型, 透過 *lock()*, *臨界區*, *unlock()* 組成。但是這種鎖模型忽略一個重要的問題, 鎖是用來保護具體資源的, 在極簡鎖模型中臨界區沒有表示被保護的資源具體是什麼。
+[[https://static001.geekbang.org/resource/image/3d/a2/3df991e7de14a788b220468836cd48a2.png]]
+
+* 改進後的鎖模型
+因此, 在改進的鎖模型中, *臨界區* 必須關聯一個被保護的資源, 並且上鎖時, 會先創建一把 *鎖* 來關聯這個被保護的資源。
+[[https://static001.geekbang.org/resource/image/28/2f/287008c8137a43fa032e68a0c23c172f.png]]
+* Java 的鎖機制: synchronized
+synchronized 可以修飾方法, 或是一個 code block, 以下是操作範例:
+#+begin_src java
+class ExclusiveLockExample {
+    // 修飾非靜態方法
+    synchronized void methodA() {
+        // 臨界區
+    }
+
+    // 修飾靜態方法
+    synchronized static void methodB() {
+        // 臨界區
+    }
+
+    // 修飾 code block
+    Object obj = new Object();
+    public void methodC() {
+        synchronized (obj) {
+            // 臨界區
+        }
+    }
+}
+#+end_src
+* 鎖保護的資源
+如果 synchronized 修飾的是非靜態的方法, 則被鎖保護的對象則是對象實例本身, 代碼等價於:
+#+begin_src java
+class ExclusiveLockExample {
+    // 修飾非靜態方法
+    synchronized (this) void methodA() {
+        // 臨界區
+    }
+
+#+end_src
+如果 synchronized 修飾的是靜態的方法, 則被鎖保護的對象則是整個 class, 代碼等價於:
+#+begin_src java
+class ExclusiveLockExample {
+    // 修飾非靜態方法
+    synchronized (ExclusiveLockExample.class) void methodB() {
+        // 臨界區
+    }
+#+end_src
+如果 synchronized 修飾的是 code block, 則需要聲明要上鎖的資源, 如果沒有則需要自行創建一個對象。
+* 用 synchronized 解決 x += 1 的問題
+考慮以下代碼是否有併發問題:
+#+begin_src java
+class SafeAdd {
+    int val = 0;
+    int get () {
+        return val;
+    }
+    synchronized void add() {
+        val += 1;
+    }
+}
+#+end_src
+首先, 由於 synchronized 保護了 add, 所以在修改數據期間, 線程不會發生切換, 因此沒有原子性的問題。再來, 由於 synchronized unlock happens-before lock, 所以我們可以確定, 當我們執行 N 次 add(), 最終 val 的值一定是 N。但是, 當我們真正要透過 get() 讀取數據時, 就發生了可見性問題, 因為目前沒有任何 happens-before 的規則保護 get() 方法。如果我們要 get() 能夠看見 add() 修改, 我們必須讓 get() 也遵守  synchronized unlock happens-before lock 這條規則, 因此代碼應該如下:
+#+begin_src java
+class SafeAdd {
+    int val = 0;
+    synchronized int get () {
+        return val;
+    }
+    synchronized void add() {
+        val += 1;
+    }
+}
+#+end_src
+此時, 被保護的資源都是 this, 且讀/寫都是互相排他的且執行過程中不會切換線程, 這樣的代碼是線程安全的。
+* 鎖和受保護資源的關係
+鎖和受保護資源之間的關係非常重要, 從數量的角度來說他們之間是 1:N 的關係才會起作用。 也就是說, 一把鎖可以保護多個資源, 但是一個資源的不同鎖之間是不互斥的。
+我們對上述案例燒做修改, 我們將 val 改成靜態變量, 將 add 改為靜態方法, 考慮以下代碼是否有併發問題:
+#+begin_src java
+class SafeAdd {
+    static int val = 0;
+    synchronized int get () {
+        return val;
+    }
+    synchronized static void add() {
+        val += 1;
+    }
+}
+#+end_src
+這裡我們實際上是使用了兩把鎖來保護相同的資源, 兩把鎖分別是 this 和 SafeAdd.class, 受保護的資源是 val, 由於制式兩把不同的鎖, 所以鎖之間並不互斥. 因此存在可見性問題, 在內存模型中如下:
+[[https://static001.geekbang.org/resource/image/60/be/60551e006fca96f581f3dc25424226be.png]]
+* 用不同的鎖保護無相關的不同資源
+上面提到但是一個資源的不同鎖之間是不互斥的, 因此一個對象的不相關的屬性, 可以用不同的鎖來保護, 這麼做可以提昇併發性, 考慮以下代碼:
+#+begin_src java
+class Account {}
+private final Object balanceLock = new Object();
+private final Object passwordLock = new Object();
+
+private int balance;
+private String password;
+
+void withdrawal(int amount) {
+    synchronized (balanceLock) {
+        if (balance >= amount) {
+            balance -= amount;
+        }
+    }
+}
+
+void getBalance () {
+   synchronized (balanceLock) {
+       return balance;
+   }
+}
+
+void setPassword (String oldPassWord, String newPassword) {
+    synchronized (passwordLock) {
+        if (oldPassWord == password) {
+            password = newPassword;
+        }
+    }
+}
+#+end_src
+* 一把鎖保護有關係的不同資源
+考慮以下代碼:
+#+begin_src java
+clas Account {
+    private int balance;
+    synchronized void transfer (Account target, int amount) {
+        if (balance >= amount) {
+            balance -= amount;
+            target.balance += amount;
+        }
+    }
+}
+#+end_src
+我們想用一把鎖 this, 保護兩個資源, this.amount 和 target.amount, 但是這麼做是錯的, 因為以 this 作為鎖, 最多只能保護到自己的資源, 我們再考慮以下代碼:
+#+begin_src java
+class Account {
+    private Object lock；
+    private int balance;
+    private Account();
+    public Account(Object lock) {
+        this.lock = lock;
+    }
+    void transfer(Account target, int amt){
+        synchronized(lock) {
+            if (this.balance > amt) {
+                this.balance -= amt;
+                target.balance += amt;
+            }
+        }
+    }
+}
+#+end_src
+我們要求在創建 instance 時必須傳入一把全局唯一對象作為鎖, 但是這樣做有個問題是, 創建 account 對象的代碼可能在多個 maven 工程之中, 這樣就沒有辦法傳入相同的對象了, 因此, 解決方案應該是使用 Account.class 作為 lock:
+#+begin_src java
+class Account {
+  private int balance;
+  void transfer(Account target, int amount){
+    synchronized(Account.class) {
+      if (this.balance > amount) {
+        this.balance -= amount;
+        target.balance += amount;
+      }
+    }
+  }
+}
+#+end_src
+或者, 把 lock 設置為 static, 效果是一樣的, 但是兩種方式都會導致併發性低下, 因為一旦發生轉帳行為, 所有帳戶都會被上鎖, 鎖保護的對象是每個帳戶的餘額, 我們應該使用顆粒度更細的鎖來解決這個問題, 但是使用更細粒度的鎖容易產生死鎖問題, 我們在下一張先討論死鎖問題, 再來討論更好的解決方案。

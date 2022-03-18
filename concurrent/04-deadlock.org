@@ -1,0 +1,125 @@
+#+TITLE: 死鎖問題
+上一章節我們使用同一把鎖 Account.class 保護多個資源, 但這會導致併發性低下, 任意兩個帳戶轉帳, 都會鎖住所有帳戶, 這並不符合現實中的需求。 我們可以試圖引入更細粒度的鎖來提昇併發性, 但是可能會導致死鎖問題, 我們可以從一個案例開始。
+* 細粒度鎖案例
+在古代要解決這樣的問題, 如果 A 要轉帳給 B, 發生轉帳時:
+1. 如果同時存在兩本帳本, 同時取走兩本帳本
+2. 如果只存在一本, 先取走該帳本, 在原地等待另一本帳本回來, 並取走兩本帳本
+3. 如果兩本帳本都沒有, 就等待
+這樣的代碼可以這樣實現:
+#+begin_src java
+class Account {
+    private int balance;
+    void transfer (Account target, int amount) {
+        synchronized (this) {
+            synchronized (target) {
+                if (balance >= amount) {
+                    balance -= amount;
+                    target.balance += amount;
+                }
+            }
+        }
+    }
+}
+#+end_src
+這樣的實現很容易產生死鎖問題, 因為如果有兩個線程, 一個先鎖住 A 帳戶, 等待 B 帳戶的鎖被釋放, 另一個線程鎖住 B 帳戶, 等待 A 釋放, 則永遠在等待其中一方式放鎖。
+* 死鎖的必要條件
+假設有兩個資源 X, Y 死鎖的必要條件:
+1. 互斥
+   資源 X, Y 分別只能被一個線程佔用
+2. 佔用且等待
+   如果有一個線程佔有 X, 且等待 Y, 那麼不釋放 X
+3. 不可搶佔
+   如果一個線程佔有 X, 則沒有其他線程可以搶佔 X
+4. 循環等待
+   存在兩個線程互相等待對方釋放已經佔有的資源
+如果要解決死鎖問題, 我們只需要破壞必要條件中的一個, 就可以解決死鎖:
+1. 互斥
+   這一條不能破壞, 因為他是保護資源的最低標準
+2. 佔用且等待
+   一次申請所有資源, 這樣就不會永佔用且等待的問題
+3. 不可搶佔
+   如果申請不到資源, 主動釋放當前的資源
+4. 循環等待
+   有序申請資源
+接下來我們分別詳細討論每一種方法
+* 破壞佔用且等待: 一次申請所有資源
+使用這種方法時, 我們將引入一個管理員角色, 當有人要操作 A, B 兩個帳本時, 需要向管理原申請, 讓管理員要同時取得 A, B 兩個帳本。 實現方面, 則是讓管理員 *同時申請資源* 的操作放在臨界區, 而且管理員也是一個全局唯一的 Singleton 對象, 我們可以考慮以下實現:
+#+begin_src java
+class Allocator {
+    private static Allocator instance = new Allocator();
+
+    private Allocator() {}
+    public static Allocator getInstance () {
+        return instance;
+    }
+
+    private List<Object> lockedResources = new ArrayList<>();
+    synchronized boolen apply (Object from , Object to) {
+        if (lockedResources.contains(from) || lockedResources.contains(to)) {
+            return false;
+        }
+        lockedResources.add(from);
+        lockedResources.add(to);
+        return true;
+    }
+
+    synchronized void free(Object from , Object to) {
+        lockedResources.remove(from);
+        lockedResources.remove(to);
+    }
+}
+#+end_src
+由於 Allocator 是維持轉帳業務必要的對象, 我們使用 eager 方式創造 Singleton, 將 instance 設置為 static 並將 constructor 私有化, 並暴露一個 public 的取得 instance 的方法。 接下來我們實現帳戶功能的部份:
+#+begin_src java
+class Account {
+    private Allocator allocator;
+    private int balance;
+    boolen transfer (Account target, int amount) {
+        if (balance < amount)
+            return false;
+        while (!allocator.apply(this, target));
+        try {
+            synchronized(this) {
+                synchronized(target) {
+                    if (balance >= amount) {
+                        balance -= amount;
+                        target.balance += amount;
+                    }
+                }
+            }
+        } finally {
+            allocator.free(this, target);
+        }
+    }
+}
+#+end_src
+* 破壞不可搶佔的條件: 主動放棄佔有的資源
+主動放棄佔有的資源很簡單, 但是這一點只透過 Java 語言層面是做不到的, synchronized 申請不到資源就會進入 blocked 狀態, 這個問題是在 SDK 層面透過 java.util.concurrent 提供的 Lock 解決的, 因此這個方法我們在後續章節討論。
+* 破壞循環等待: 按序申請資源
+按序申請資源的實現很容易, 只需要指定一種順序, 上鎖時按照序號小的開始上鎖即可。 在這裡我們假設使用 id 大小來決定順序, 實現如下:
+#+begin_src java
+class Account {
+    private int id;
+    private int balance;
+    void transfer (Account target, int amount) {
+        Account smaller = id < target.id ? this : target;
+        Account greater = smaller == target ? this : targe;
+
+        synchronized (smaller) {
+            synchronized (greater) {
+                if (balance >= amount) {
+                    balance -= amount;
+                    target.balance += amount;
+                }
+            }
+        }
+    }
+}
+#+end_src
+* 方案成本
+在這個案例中, 我們如果破壞佔用且等待, 要求一次必須申請所有資源的方式, 會進入 while 循環等待, 這個代價可能很高, 但使用一次性申請資源的方式, 總比一次把所有的 account 都鎖住要強, 是這樣嗎?
+我們看看造成瓶頸的代碼:
+#+begin_src java
+while (!allocator.apply(this, target));
+#+end_src
+當我們掉入 while 被 blocked 時, CPU 其實是瘋狂的判斷 while 的條件, CPU 使用率會飆高, 而且浪費在沒有意義的條件判斷上, 這個問題我們在下一章解決。 而選擇破壞循環等待, 以按序申請資源的方式, 在此案例中是代價最低的。在選擇方案時, 我們永遠必須評估實施方案的成本。
