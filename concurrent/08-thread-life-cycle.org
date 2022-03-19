@@ -1,0 +1,130 @@
+#+TITLE: 線程的生命週期
+線程是操作系統層面的概念, 每一種提供線程操作的高級語言都是在實現操作系統提供的線程模型。 我們可以先理解通用的線程模型, 再理解 Java 的線程模型。
+* 通用線程的生命週期
+通用的線程模型可以用下圖表示:
+[[https://static001.geekbang.org/resource/image/9b/e5/9bbc6fa7fb4d631484aa953626cf6ae5.png]]
+ * 初始態
+   指線程已經被創建, 但是還不能被執行。 之所以不能被執行, 是因為這個 *創建* 是語言層面的創建, 也就是說這個狀態是語言層面的狀態, 在操作系統層面真正的線程還沒被創建。
+ * 可運行態
+   線程可以真正被執行, 此時操作系統才真正創建好了線程, 這是等待調度、分配給 CPU 執行的狀態。
+ * 運行態
+   當有 CPU 空閒時, 操作系統會分配給該 CPU 一個處於可運行態的線程執行, 被分配給 CPU 執行的線程會切換成運行態。
+ * 休眠態
+   運行態的線程如果調用了一個阻塞的 API, 例如以阻塞的方式讀文件, 或者等待某事件, 比如等待條件變量被滿足, 那麼運行態的線程會切換成休眠態, 並且釋放 CPU, 使 CPU 成為空閒的 CPU, 注意, 處在休眠的線程永遠不會被 CPU 執行。
+ * 中止態
+   線程執行完, 或是線程異常中止時, 就會進入中止態。 處於中止態的線程不會再切換成任何其他的狀態, 這就是線程生命週期的終點了。
+
+這五種狀態, 在高級語言中有各自的簡化, 例如: C 語言的 POSIX Threads 規範, 把初始態和可運行態合併, 因為於這種貼著 OS 編程的語言來說, 創建好的線程就是 ready 了。 而 Java 則將可運行態和運行態合併, 對於 JVM 來說, 所謂的運行, 就是把線程調度交給操作系統, 這兩種狀態的分別只有在操作系統層面是有意義的, JVM 不關心這兩種狀態的分別。
+
+除了簡化, 有些高級語言會對一些狀態細化, 比如 Java 細化了休眠態, 我們在下一節詳細討論 Java 線程的生命週期模型。
+* Java 線程的生命週期
+Java 線程的生命週期和通用線程的生命週期的不同點在於, Java 線程的生命週期面向的是 JVM, 而通用線程的生命週期面向的是 OS。
+
+Java 線程的生命週期有六種狀態, 其中 *NEW* 對應的是 *初始化狀態*, *TERMINATED* 對應的是 *中止態*, 而 *可運行態* 和 *運行態* 被合併成 *RUNNABLE 可運行態*, 意思是線程可運行/正在運行, 具體是哪種要看操作系統如何調度, 而 *休眠態* 則是細化成三種: *BLOCKED 阻塞中* 、 *WAITING 無限等待中* 、 *TIME_WAITING 有限等待中*, 所以 Java 線程的生命週期可以這樣表示:
+[[https://static001.geekbang.org/resource/image/3f/8c/3f6c6bf95a6e8627bdf3cb621bbb7f8c.png]]
+
+** NEW to RUNNABLE
+任何一種高級語言的線程都是基於操作系統的線程的, 也就是, 高級語言把對操作系統線程的調用封裝, 對外只暴露高級語言的線程方法, 所以首先我們先解決第一件事情, 也就是 NEW 如何切換成 RUNNABLE。
+
+Java 剛創建出來的 Thread 的實例就是一個處在 NEW 狀態的線程, 創建 Thread 的 instance 有兩種方法, *第一種方法是繼承 Thread, 並重寫 run()*:
+#+begin_src java
+class MyThread extends Thread {
+    @Override
+    public void run() {
+        //...
+    }
+}
+#+end_src
+另一種是實現 Runnable 接口:
+#+begin_src java
+class A implements Runnable {
+    @Override
+    public void run() {
+        //...
+    }
+}
+#+end_src
+
+當有程序 new 了 Thread 類的 instance, 或是 new 了實現 Runnable 接口的 instance, 這些線程都只是處在 NEW 狀態, 真正要轉換為 RUNNABLE, 只需要有程序要調用該實例的 start() 方法:
+#+begin_src java
+Mythread t = new MyThread();
+t.start();
+#+end_src
+** RUNNABLE to BLOCKED
+只有一種情況下, 線程會觸發這種轉換, 就是線程等待 synchronized 的隱式鎖, 也就是線程正在臨界區外等待。 之前說過, synchronized 修飾的方法體與 code block 會在代碼中規劃出一個臨界區, 這個區域只有一個線程可以進入, 其他線程只能等待。 而這些等待的線程就處於 BLOCKED 狀態。
+
+有一個很容易導致混搖的問題: 當我們調用 Java 的阻塞 API 時, 線程是否會切換成 BLOCKED 狀態? 答案其實是 *並不會*, 這個所謂的阻塞的 API 指的是 OS 層面的狀態轉換, 當調用阻塞 API 時, OS 層面的線程是真的會處於休眠狀態的, 但是 JVM 的線程狀態依然是 RUNNABLE, 因為調度權依然在 OS 手上。要再次強調, Java 線程的生命週期和通用線程的生命週期的不同點在於, Java 線程的生命週期面向的是 JVM, 而通用線程的生命週期面向的是 OS, JVM 並不關心操作系統層面的調度狀態, 因為在 JVM 看來, 等待 CPU 的使用權 (OS 的可執行態), 與等待 I/O (休眠態) 都是在操作系統等待/調度一種資源, 所以都是操作系統層面的調用。
+
+所以, 當我們調用 Java 的阻塞 API 時, 線程的阻塞, 指的是 OS 層面的狀態, 不是 Java 的線程狀態。
+** RUNNABLE to WAITING
+這種狀態轉換有三種可能會觸發:
+
+第一種, 線程上鎖成功, 但是條件變量沒滿足, 觸發了 Object.wait()。
+
+第二種, 調用無參數的 Thread.join() 方法。 其中, Thread.join() 方法是一種線程同步的方法, 例如有一個 Thread A, 當調用 A.join() 時, 執行 A.join() 的線程會等待 Thread A 的 run() 執行完畢, 而等待 A.run() 執行的時候, 就會從 RUNNABLE 切換到 WAITING。
+
+第三種, 調用 LockSupport.park() 方法。 SDK 併發工具包鎖, 都是基於 LockSupport 實現的, 調用 LockSupport.park() 方法後的線程會被阻塞, 線程的狀態會從 RUNNABLE 切換到 WAITING, 而當調用 LockSupport.unpark(Thread thread), 可以喚醒 thread, thread 會從 WAITING 切換成 RUNNABLE。
+** RUNNABLE to TIME_WAITING
+切換到 TIME_WAITING 狀態, 都是帶有超時性質的方法調用:
+1. 調用帶超時參數的 Thread.sleep(long millis)
+2. 調用帶超時參數的 Object.wait(long timeout)
+3. 調用帶超時參數的 Thread.join(long millis)
+4. 調用帶超時參數的 LockSupport.parkNanos(Object blocker, long deadline)
+5. 調用帶超時參數的 LockSupport.parkUntil(long deadline)
+** RUNNABLE to TERMINATED
+當 Thread.run() 執行完, 或是執行時拋出異常, 該線程會自動切換到 TERMINATED。 有時候我們想要強制中斷 Thread.run() 的執行怎麼辦? 比如, run() 有一個遠程調用, 但是網路實在太慢了, 想要強行中止。 Thread 對象裡有一個 stop() 方法, 不過已經被標記為 @Deprecated, 所以建議不要使用。 正確的姿勢是調用 interrupt() 方法。
+
+* stop() 和 interrupt() 的區別
+** stop()
+stop() 這個方法是一種非常暴力的方法, 會真的直接殺死線程, 如果線程擁有 ReetrantLock, 被 stop() 的線程並不會自動調用 ReetrantLock 的 unlock() 去釋放鎖, 這樣沒有任何線程有機會能獲得這個 ReetrantLock, 類似的方法還有 suspend() 和 resume(), 這些都是非常危險的方法。
+
+** interrupt()
+interrupt() 方法則溫柔多了, 它僅僅只會通知線程, 被通知的線程可以執行一些後續操作, 當然也可以選擇無視這個通知, 看得出來這是一種線程同步的手段。 而被 interrupt() 的線程, 是怎麼收到通知的呢? 一種是異常, 一種是主動檢測。
+
+*** 通過異常通知
+ * interrupt 一個不活躍的線程
+   當線程 A 處於 WAITING 或 TIME_WAITING 時, 有線程調用了 A.interrupt(), 會使 A 返回 RUNNABLE, 同時, A 會立刻觸發 InterruptedException, 這樣就能進入異常處裡的代碼。 我們上面提到 RUNNABLE 在 WAITING 或 TIME_WAITING 切換時, 都是調用了類似 wait()、join()、sleep() 这样的方法, 去看這些方法的簽名, 都有 throws InterruptedException, 這個異常的觸發條件就是: 有人調用了該線程對象的 interrupt() 方法。
+
+ * interrupt 一個活躍的線程
+   當線程 A 處於 RUNNABLE 時, 並且被阻塞在 java.nio.channels.InterruptibleChannel 上時, 如果其他線程調用 A 的 interrupt 方法, 線程 A 會觸發 java.nio.channels.ClosedByInterruptException 這個異常, 然後可以進入異常處理; 而如果被阻塞在 java.nio.channels.Selector 上時, 如果其他線程調用 A 的 interrupt 方法, 線程 A 會立刻返回。
+
+*** 主動檢測
+如果線程 A 處在 RUNNABLE 狀態, 但是並沒有阻塞在 I/O 上, 而是真的在運行中, 此時就必須透過主動檢測的方式來 interrupt, 在代碼中必須實現 isInterrupted() 來檢測是否已經被中斷, 不過依然是要有別的線程調用 A.interrupt()。
+
+* interrupt
+調用 Thread.interrupt, 其實是把 Thread 對象的 *interrupt flag* 改成 *interrupted*, 在有中斷檢查的方法被調用時, 才會觸發中斷檢查, 這點很重要, 因為在觸發 InterruptedException 的線程會回到 RUNNABLE 狀態, 此時可以主動退出程序, 使線程進入 TERMINATED 狀態。 試分析以下代碼能否透過 break 退出:
+#+begin_src java
+Thread th = Thread.currentThread();
+while(true) {
+  if(th.isInterrupted()) {
+    break;
+  }
+  // ...
+  try {
+    Thread.sleep(100);
+  }catch (InterruptedException e){
+    e.printStackTrace();
+  }
+}
+#+end_src
+
+th 運行後通常處於 sleep() 狀態, 如果有線程調用 th.interrupt(), 此時 th 會觸發 InterruptedException, 這時 th 會從 TIME_WAITING 切換成 RUNNABLE, 這會執行 printStackTrace, 然後又會進入 while 循環, 因為線程在 TIME_WAITING 時已經被 interrupt 過了, 如果要透過 if(th.isInterrupted()), 可以這樣做:
+#+begin_src java
+Thread th = Thread.currentThread();
+while(true) {
+  if(th.isInterrupted()) {
+    break;
+  }
+  // ...
+  try {
+    Thread.sleep(100);
+  }catch (InterruptedException e){
+    Thread.currentThread().interrupt();
+    e.printStackTrace();
+  }
+}
+#+end_src
+
+第一次被 interrupt 時, th 被喚醒成 RUNNABLE, 進入異常處理的代碼, 此時 Thread.currentThread().interrupt() 這一行代碼又會把中斷 flag 標記為 interrupted, 當程序執行到下一個 interrupt 檢查點, 也就是 if(th.isInterrupted()) 時, 透過 break 退出。
+* 查看線程狀態
+可以通過 jstack, Java VisualVM 等工具, 將 JVM 的所有線程資訊導出, 完整的線程訊息包括線程狀態、stack 、鎖的訊息。

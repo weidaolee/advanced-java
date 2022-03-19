@@ -1,0 +1,44 @@
+#+TITLE: 局部變量與線程封閉
+我們多次強調, 多線程操作可變的共享變量時, 會有線程安全的問題, 這個問題我們甚至給它一個術語叫做 *Data Race 數據競爭*, 我們也知道當我們訪問局部變量時沒有線程安全的問題。而我們在本章要討論局部變量是線程安全的原因。
+* 方法是如何被 CPU 執行的
+我們考慮以下方法:
+#+begin_src java
+int [] fibonacci(int n) {
+    int r[] = new int[];
+    r[0] = r[1] = 1;
+
+    for (int i = 2; i < n; i ++) {
+        r[i] = r[i - 2] + r[i - 1];
+    }
+
+    return r;
+}
+#+end_src
+和調用的方法:
+#+begin_src java
+int a = 7;
+int [] b = fibonacci(a);
+int [] c = b;
+#+end_src
+高級語言的普通語句, 比如: r[i] = r[i - 2] + r[i - 1]; 這句話編譯成 CPU 指令很容易, 但是方法調用就不容易了, 比如: int [] b = fibonacci(a);
+當我們調用 fibonacci(a) 時, CPU 首先要找到 fibonacci 這個方法的地址, 然後跳轉到這個地址去執行代碼, 執行完後, 這個方法要能夠返回, 也就是要找到 int [] c = b; 這條語句的地址, 再跳到這個地址去執行:
+[[https://static001.geekbang.org/resource/image/9b/1f/9bd881b545e1c67142486f6594dc9d1f.png]]
+上圖展示了 CPU 透過地址並跳轉到要執行計算的地方, 但是還有一個很重要問題是, CPU 去哪裡找到調用方法的參數和返回地址呢? 根據 CPU 個工作原理我們知道: 通過 CPU 的堆棧寄存器。 CPU 支持一種 stack 結構, 由於這個 stack 是跟方法調用有關的, 所以又叫 call stack。
+
+例如有 A、B、C 三個方法, 調用關係是 A -> B -> C, 則在運行時, 會構建出以下的 call stack。 *每個方法在 call stack 中都有自己的獨立空間, 稱為 stack frame*, 每個 stack frame 中有方法需要的參數和返回地址, 當發生方法調用時, 會創建新的 stack frame, 並 push 到 call stack 裡; 當方法要 return 時, 對應的 stack frame 就會被 pop:
+[[https://static001.geekbang.org/resource/image/67/c7/674bb47feccbf55cf0b6acc5c92e4fc7.png]]
+
+* 局部變量
+我們知道了 CPU 執行方法的過程後, 還有個關鍵問題: 方法內部的局部變量存在哪裡? 我們合理的推測一下, 局部變量的作用範圍應該與方法體一樣, 所以局部變量所佔用的空間, 應該在方法返回後就釋放掉, 所以 *局部變量應該被存放在 stack frame 裡*, 而實際上確實如此。
+[[https://static001.geekbang.org/resource/image/ec/9c/ece8c32d23e4777c370f594c97762a9c.png]]
+
+現在我們應該能明確 *new 出來的對象放在 heap 裡, 局部變量放在 stack 裡* 的確切意思: *一個變量想要跨越方法的邊界, 必須被放在 heap 裡。* 並且, 所謂 *new 出來的對象放在 heap 裡* 指的是數據, 方法如果有對該對象的引用, 這些引用也是在 stack frame 裡, 並引用隨著方法返回而消亡。
+
+* Call Stack 與 Thread
+如果是不同線程, 那麼它們之間的 call stack 是什麼關係? 事實上, *每個 Thread 都有自己獨立的 call stack*, 因為如果不是這樣, 方法返回時就會反回到錯誤的地方, 線程之間就互相干擾了。 如下圖所示, 每個線程都有自己獨立的 call stack:
+[[https://static001.geekbang.org/resource/image/84/1a/840cb955e521bd51776dbcdad3dba11a.png]]
+
+* Thread Confinement 線程封閉
+方法是裡的局部變量, 因為不是共享的, 所以不會有線程安全問題, 這樣純樸的思想已經成為解決併發問題的重要思路, 並且擁有響噹噹的名字: *Thread Confinement 線程封閉*, 翻譯成比較好理解的意思是: *僅在單線城內訪問的數據。*
+
+採用 *線程封閉* 的解決方案非常多, 例如從數據庫連接池裡獲取的 Connection, 在 JDBC 的規範裡並沒有要求這個 Connection 是線程安全的; *數據庫連接池是透過線程封閉的技術, 保證了一個 Connection 被一個線程獲取後, 在這個 Connection 斷開連接之前, 不會被分配給其他線程, 從而保證了 Connection 是線程安全的。*
