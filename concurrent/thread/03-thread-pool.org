@@ -1,0 +1,940 @@
+#+TITLE: 線程池
+線程的創建非常昂貴, 需要 JVM 和 OS 配合完成大量工作:
+1. 需要進行 system call 以在 OS 創建並註冊 OS 層面的線程
+2. 為每個線程的 stack 分配內存空間, 至少包含 1MB 的空間
+
+如果線程在高併發的系統中頻繁的創建和銷毀是在開發環境中不被允許的, 正確的作法是引入 Thread Pool 線程池, 線程池解決了:
+1. 線程復用: 以線程重用的方式取代頻繁的銷毀/創建
+2. 線程管理: 紀錄線程執行的基本信息, 例如: 完成任務的數量、空閒時等, 以便對線程做有效的管理。
+* JUC 的線程架構
+[[./image/Executors-uml.png]]
+ * Executors
+   Executors 是一個靜態工廠類, 透過靜態工廠方法可以獲得 ExecutorService 和 ScheduledExecutorServic 的線程池對象。
+ * ExecutorService 和 AbstractExecutorService
+   ExecutorService 是一種對外提供接收任務並 submit 提交給 Executor 執行的線程池接口, 而 AbstractExecutorService 則為這個 interface 實現了一些默認方法。
+ * ScheduledExecutorServce
+   繼承了 ExecutorService 的 interface, 它提供了可以接收延時或週期性任務的線程池接口。
+ * Executor
+   是任務執行者的 interface, 提供了 execute() 來執行已經提交的 Runnable 實例。 他存在的目的是將讓誤的提交與執行分離。
+ * ThreadPoolExecutor 和 ScheduledThreadPoolExecutor
+   JUC 的兩個真正的 Thread Pool 實現類
+* ExecutorService
+我們在可以看到 JUC UML 中, ExecutorService 處於相當核心的地位, 我們會從 source code 來理解它, 它主要有以下功能:
+1. 透過繼承 Executor, 承接了無返回值、無聲明異常的併發任務的提交的歷史問題
+2. 提供功能更完善的 FutureTask 的任務提交
+3. 規範了優雅的關閉線程池的方式
+** execute 和 submit
+#+begin_src java
+public interface Executor {
+
+    /**
+     * Executes the given command at some time in the future.  The command
+     * may execute in a new thread, in a pooled thread, or in the calling
+     * thread, at the discretion of the {@code Executor} implementation.
+     *
+     * @param command the runnable task
+     * @throws RejectedExecutionException if this task cannot be
+     * accepted for execution
+     * @throws NullPointerException if command is null
+     */
+    void execute(Runnable command);
+}
+#+end_src
+
+#+begin_src java
+public interface ExecutorService extends Executor {
+    /**
+     * Submits a value-returning task for execution and returns a
+     * Future representing the pending results of the task. The
+     * Future's {@code get} method will return the task's result upon
+     * successful completion.
+     *
+     * <p>
+     * If you would like to immediately block waiting
+     * for a task, you can use constructions of the form
+     * {@code result = exec.submit(aCallable).get();}
+     *
+     * <p>Note: The {@link Executors} class includes a set of methods
+     * that can convert some other common closure-like objects,
+     * for example, {@link java.security.PrivilegedAction} to
+     * {@link Callable} form so they can be submitted.
+     *
+     * @param task the task to submit
+     * @param <T> the type of the task's result
+     * @return a Future representing pending completion of the task
+     * @throws RejectedExecutionException if the task cannot be
+     *         scheduled for execution
+     * @throws NullPointerException if the task is null
+     */
+    <T> Future<T> submit(Callable<T> task);
+
+    /**
+     * Submits a Runnable task for execution and returns a Future
+     * representing that task. The Future's {@code get} method will
+     * return the given result upon successful completion.
+     *
+     * @param task the task to submit
+     * @param result the result to return
+     * @param <T> the type of the result
+     * @return a Future representing pending completion of the task
+     * @throws RejectedExecutionException if the task cannot be
+     *         scheduled for execution
+     * @throws NullPointerException if the task is null
+     */
+    <T> Future<T> submit(Runnable task, T result);
+
+    /**
+     * Submits a Runnable task for execution and returns a Future
+     * representing that task. The Future's {@code get} method will
+     * return {@code null} upon <em>successful</em> completion.
+     *
+     * @param task the task to submit
+     * @return a Future representing pending completion of the task
+     * @throws RejectedExecutionException if the task cannot be
+     *         scheduled for execution
+     * @throws NullPointerException if the task is null
+     */
+    Future<?> submit(Runnable task);
+#+end_src
+execute 和 submit 主要有三點不同:
+1. 接收的任務類型不同
+   我們在可以看到 execute 實際上就是執行 run 而已, 而 submit 可以接收 Runnable 或 Callable 的任務。 注意, Callable 的 call() 本來是和 Runnable 完全無關的 interface, 而 submit 可以直接些收實現了  Callable 的 task
+2. submit 可以有返回值
+   如果 submit 接收 Callable 的任務, 或是接收了 RunnableFuture 的任務, 那麼可以透過 get() 來獲取 return 的結果
+3. submit 可以進行異常處理
+   由於 submit return 的是 Future, 所以可以進行異常處理。
+
+透過 submit 獲得任務執行的結果:
+#+begin_src java
+public class GetReturnableTaskResultDemo {
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newScheduledThreadPool(1);
+        Future<Integer> future = pool.submit(new Callable<Integer>() {
+            @Override
+            public Integer call() throws Exception {
+                return (int) (Math.random() * 10);
+            }
+        });
+        try {
+            int result = future.get();
+            System.out.println("retuned result:" + result);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (ExecutionException e) {
+            e.printStackTrace();
+        }
+        pool.shutdown();
+    }
+}
+#+end_src
+注意, 只有當調用了 result = future.get(), 此時才會阻塞等待 task 執行完, 如果有必要可以傳入 timeout。
+
+透過 submit 捕獲 Exception:
+#+begin_src java
+public class TargetTaskWithError extends TargetTask{
+    @Override
+    public void run() {
+        super.run();
+        throw new RuntimeException("Error from:" + taskName);
+    }
+}
+
+public class CatchErrorWithFutureTaskDemo {
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newScheduledThreadPool(2);
+        pool.execute(new TargetTaskWithError());
+        Future<?> future = pool.submit(new TargetTaskWithError());
+        try {
+            if (future.get() == null) {
+                System.out.println("task done.");
+            }
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (ExecutionException e) {
+            e.printStackTrace();
+        }
+    }
+}
+#+end_src
+這裡我們提交了兩個任務, 一個是透過 pool.execute(new TargetTaskWithError()); 提交, 另一個是透過 Future<?> future = pool.submit(new TargetTaskWithError()); 提交, 以下是捕獲的 Exception:
+java.util.concurrent.ExecutionException: java.lang.RuntimeException: Error from:task-2
+	at java.util.concurrent.FutureTask.report(FutureTask.java:122)
+	at java.util.concurrent.FutureTask.get(FutureTask.java:192)
+	at threadpool.factorymethod.CatchErrorWithFutureTaskDemo.main(CatchErrorWithFutureTaskDemo.java:14)
+Caused by: java.lang.RuntimeException: Error from:task-2
+
+我們可以看到, 只有 task-2 成功捕獲了異常。
+
+** invokeAll 和 invokeAny
+有時候我們想要一次性 submit 很多任務, 此時可以使用 invokeAll 來提交任務, 注意, 此種方法需要以 List 來接收結果:
+#+begin_src java
+
+    /**
+     * Executes the given tasks, returning a list of Futures holding
+     * their status and results when all complete.
+     * {@link Future#isDone} is {@code true} for each
+     * element of the returned list.
+     * Note that a <em>completed</em> task could have
+     * terminated either normally or by throwing an exception.
+     * The results of this method are undefined if the given
+     * collection is modified while this operation is in progress.
+     *
+     * @param tasks the collection of tasks
+     * @param <T> the type of the values returned from the tasks
+     * @return a list of Futures representing the tasks, in the same
+     *         sequential order as produced by the iterator for the
+     *         given task list, each of which has completed
+     * @throws InterruptedException if interrupted while waiting, in
+     *         which case unfinished tasks are cancelled
+     * @throws NullPointerException if tasks or any of its elements are {@code null}
+     * @throws RejectedExecutionException if any task cannot be
+     *         scheduled for execution
+     */
+    <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks)
+        throws InterruptedException;
+
+    /**
+     * Executes the given tasks, returning a list of Futures holding
+     * their status and results
+     * when all complete or the timeout expires, whichever happens first.
+     * {@link Future#isDone} is {@code true} for each
+     * element of the returned list.
+     * Upon return, tasks that have not completed are cancelled.
+     * Note that a <em>completed</em> task could have
+     * terminated either normally or by throwing an exception.
+     * The results of this method are undefined if the given
+     * collection is modified while this operation is in progress.
+     *
+     * @param tasks the collection of tasks
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the timeout argument
+     * @param <T> the type of the values returned from the tasks
+     * @return a list of Futures representing the tasks, in the same
+     *         sequential order as produced by the iterator for the
+     *         given task list. If the operation did not time out,
+     *         each task will have completed. If it did time out, some
+     *         of these tasks will not have completed.
+     * @throws InterruptedException if interrupted while waiting, in
+     *         which case unfinished tasks are cancelled
+     * @throws NullPointerException if tasks, any of its elements, or
+     *         unit are {@code null}
+     * @throws RejectedExecutionException if any task cannot be scheduled
+     *         for execution
+     */
+    <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks,
+                                  long timeout, TimeUnit unit)
+        throws InterruptedException;
+#+end_src
+如果只想提交一個 task set 中的一個任務, 可以用 invokeAny:
+#+begin_src java
+
+    /**
+     * Executes the given tasks, returning the result
+     * of one that has completed successfully (i.e., without throwing
+     * an exception), if any do. Upon normal or exceptional return,
+     * tasks that have not completed are cancelled.
+     * The results of this method are undefined if the given
+     * collection is modified while this operation is in progress.
+     *
+     * @param tasks the collection of tasks
+     * @param <T> the type of the values returned from the tasks
+     * @return the result returned by one of the tasks
+     * @throws InterruptedException if interrupted while waiting
+     * @throws NullPointerException if tasks or any element task
+     *         subject to execution is {@code null}
+     * @throws IllegalArgumentException if tasks is empty
+     * @throws ExecutionException if no task successfully completes
+     * @throws RejectedExecutionException if tasks cannot be scheduled
+     *         for execution
+     */
+    <T> T invokeAny(Collection<? extends Callable<T>> tasks)
+        throws InterruptedException, ExecutionException;
+
+    /**
+     * Executes the given tasks, returning the result
+     * of one that has completed successfully (i.e., without throwing
+     * an exception), if any do before the given timeout elapses.
+     * Upon normal or exceptional return, tasks that have not
+     * completed are cancelled.
+     * The results of this method are undefined if the given
+     * collection is modified while this operation is in progress.
+     *
+     * @param tasks the collection of tasks
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the timeout argument
+     * @param <T> the type of the values returned from the tasks
+     * @return the result returned by one of the tasks
+     * @throws InterruptedException if interrupted while waiting
+     * @throws NullPointerException if tasks, or unit, or any element
+     *         task subject to execution is {@code null}
+     * @throws TimeoutException if the given timeout elapses before
+     *         any task successfully completes
+     * @throws ExecutionException if no task successfully completes
+     * @throws RejectedExecutionException if tasks cannot be scheduled
+     *         for execution
+     */
+    <T> T invokeAny(Collection<? extends Callable<T>> tasks,
+                    long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException;
+#+end_src
+** 優雅的關閉 ExecutorService
+#+begin_src java
+    /**
+     * Initiates an orderly shutdown in which previously submitted
+     * tasks are executed, but no new tasks will be accepted.
+     * Invocation has no additional effect if already shut down.
+     *
+     * <p>This method does not wait for previously submitted tasks to
+     * complete execution.  Use {@link #awaitTermination awaitTermination}
+     * to do that.
+     *
+     * @throws SecurityException if a security manager exists and
+     *         shutting down this ExecutorService may manipulate
+     *         threads that the caller is not permitted to modify
+     *         because it does not hold {@link
+     *         java.lang.RuntimePermission}{@code ("modifyThread")},
+     *         or the security manager's {@code checkAccess} method
+     *         denies access.
+     */
+    void shutdown();
+
+    /**
+     * Attempts to stop all actively executing tasks, halts the
+     * processing of waiting tasks, and returns a list of the tasks
+     * that were awaiting execution.
+     *
+     * <p>This method does not wait for actively executing tasks to
+     * terminate.  Use {@link #awaitTermination awaitTermination} to
+     * do that.
+     *
+     * <p>There are no guarantees beyond best-effort attempts to stop
+     * processing actively executing tasks.  For example, typical
+     * implementations will cancel via {@link Thread#interrupt}, so any
+     * task that fails to respond to interrupts may never terminate.
+     *
+     * @return list of tasks that never commenced execution
+     * @throws SecurityException if a security manager exists and
+     *         shutting down this ExecutorService may manipulate
+     *         threads that the caller is not permitted to modify
+     *         because it does not hold {@link
+     *         java.lang.RuntimePermission}{@code ("modifyThread")},
+     *         or the security manager's {@code checkAccess} method
+     *         denies access.
+     */
+    List<Runnable> shutdownNow();
+
+    /**
+     * Returns {@code true} if this executor has been shut down.
+     *
+     * @return {@code true} if this executor has been shut down
+     */
+    boolean isShutdown();
+
+    /**
+     * Returns {@code true} if all tasks have completed following shut down.
+     * Note that {@code isTerminated} is never {@code true} unless
+     * either {@code shutdown} or {@code shutdownNow} was called first.
+     *
+     * @return {@code true} if all tasks have completed following shut down
+     */
+    boolean isTerminated();
+
+    /**
+     * Blocks until all tasks have completed execution after a shutdown
+     * request, or the timeout occurs, or the current thread is
+     * interrupted, whichever happens first.
+     *
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the timeout argument
+     * @return {@code true} if this executor terminated and
+     *         {@code false} if the timeout elapsed before termination
+     * @throws InterruptedException if interrupted while waiting
+     */
+    boolean awaitTermination(long timeout, TimeUnit unit)
+        throws InterruptedException;
+#+end_src
+當我們執行 shutdown 時代表我們對外不再提供服務, 但是已經接收的任務會繼續執行。 如果不想等待這些任務執行完可以使用 shutdownNow, 這會嘗試中止所有的任務, 這兩個方法都是 asynchronous 的, 而 awaitTermination 則是 synchronous 的, 調用 awaitTermination 會被阻塞直到線程池被關閉, 或是 timeout。
+
+awaitTermination 會 return 一個 boolean, 表示是否成功執行完所有任務, 優雅關閉可以這樣做:
+1. 執行 shutdown, 等待任務執行完畢
+2. 執行 awaitTermination, 如果 return false, 則 shutdownNow
+3. 執行 awaitTermination, 如果 return false, 則重新 awaitTermination N 次, 然後執行 shutdownNow
+* ThreadPoolExecutor
+ThreadPoolExecutor 是真正的 concrete class, Executors 本身是一個靜態工廠方法, 其目的是提供線程池的快速創建, 但是在實際開發中是被禁止的, 因為線程池的設置經常直接影響整個服務的正常運行, 所以實際開發中通常要求要使用 ThreadPoolExecutor 的 constructor 來創建:
+#+begin_src java
+    /**
+     * Creates a new {@code ThreadPoolExecutor} with the given initial
+     * parameters.
+     *
+     * @param corePoolSize the number of threads to keep in the pool, even
+     *        if they are idle, unless {@code allowCoreThreadTimeOut} is set
+     * @param maximumPoolSize the maximum number of threads to allow in the
+     *        pool
+     * @param keepAliveTime when the number of threads is greater than
+     *        the core, this is the maximum time that excess idle threads
+     *        will wait for new tasks before terminating.
+     * @param unit the time unit for the {@code keepAliveTime} argument
+     * @param workQueue the queue to use for holding tasks before they are
+     *        executed.  This queue will hold only the {@code Runnable}
+     *        tasks submitted by the {@code execute} method.
+     * @param threadFactory the factory to use when the executor
+     *        creates a new thread
+     * @param handler the handler to use when execution is blocked
+     *        because the thread bounds and queue capacities are reached
+     * @throws IllegalArgumentException if one of the following holds:<br>
+     *         {@code corePoolSize < 0}<br>
+     *         {@code keepAliveTime < 0}<br>
+     *         {@code maximumPoolSize <= 0}<br>
+     *         {@code maximumPoolSize < corePoolSize}
+     * @throws NullPointerException if {@code workQueue}
+     *         or {@code threadFactory} or {@code handler} is null
+     */
+    public ThreadPoolExecutor(int corePoolSize,
+                              int maximumPoolSize,
+                              long keepAliveTime,
+                              TimeUnit unit,
+                              BlockingQueue<Runnable> workQueue,
+                              ThreadFactory threadFactory,
+                              RejectedExecutionHandler handler) {...}
+#+end_src
+** corePoolSize 和 maximumPoolSize
+ * corePoolSize 就是 minimunPoolSize, 如果實際工作的線程數 <= corePoolSize, 這些線程會處於 *Idle 閒置*, 而不會被回收, 以便能立刻回應最新的任務提交。
+ * maximumPoolSize 是允許的最大線程數上限, 如果 corePoolSize <= 實際工作線程數 < maximumPoolSize, 則每收到一個新的任務提交, 就會創建新的線程。
+ * 當線程數 = maximumPoolSize 且沒有 Idle 的線程, 新收到的任務會被放入 workQueue 中等待, 或是被 handler 拒絕。
+ * 可以透過 setCorePoolSize 和 setMaximumPoolSize 來動態設定線程數量。
+** keepAliveTime 和 unit
+ * keepAliveTime 決定了線程處在 Idle 的線程可以存活多久, unit 則是 keepAliveTime 的時間單位。 當線程數 > corePoolSize 且有線程處在 Idle 的時間達到了 keepAliveTime, 那麼它會被回收。
+ * 如果想要讓 core thread 也可以因為達到 keepAliveTime 而被回收, 可以透過 allowCoreThreadTimeOut(true) 方法設置。
+ * 可以透過 setKeepAliveTime 動態設置。
+** 線程池的任務調度流程
+線程池的任務調度包含接收任務和執行任務兩部份, 調度流程遵守以下原則:
+1. 線程數量 <= corePoolSize 時, 如果收到新任務, 傾向於創建新的線程去執行任務, 而不是使用處於 Idle 的線程
+2. 如果線程池中的任務數 > corePoolSize, 但 BlockingQueue 沒有滿的情況下, 那麼收到新任務時將任務加入 workQueue, 而不是創建新的線程
+3. 如果線程池中的任務數 > corePoolSize, 且 BlockingQueue 已經滿的情況下, 那麼收到新任務時將任務才會創建新的線程並立刻執行新的任務, 直到線程數量達到 maximumPoolSize
+4. 線程完成任務後, 傾向於從 BlockingQueue 中取得任務來執行。
+5. 當線程數量達到 maximumPoolSize 且 BlockingQueue 滿的情況下, 如果收到新任務會執行 RejectedExecutionHandler 的拒絕策略
+** ThreadFactory
+ThreadFactory 是一個 interface:
+#+begin_src java
+public interface ThreadFactory {
+
+    /**
+     * Constructs a new {@code Thread}.  Implementations may also initialize
+     * priority, name, daemon status, {@code ThreadGroup}, etc.
+     *
+     * @param r a runnable to be executed by new thread instance
+     * @return constructed thread, or {@code null} if the request to
+     *         create a thread is rejected
+     */
+    Thread newThread(Runnable r);
+}
+#+end_src
+這是用於創建 Thread Object 的工廠, 上一節我們有提到 Thread 本身有很多屬性, 比如: name, priority, stackSize 等。 我們可以將配置 Thread 的邏輯實現在這裡。
+** BlockingQueue
+BlockingQueue 和一般的 Queue 有一個區別: 有一些對 BlockingQueue 的操作如果不滿足條件, 會 block 這些操作, 比如當 BlockingQueue 是 empty, 一個 Thread 試圖從 BlockingQueue 取 Task 會被 block, 直到 BlockingQueue 有 task 為止。 常見的 BlockingQueue 實現:
+ * ArrayBlockingQueue
+   基於 Array 實現的有界 queue, 要指定大小, 任務按 FIFO 排序。
+ * LinkedBlockingQueue
+   基於 LinkedList 實現的 queue, 任務按 FIFO 排序, 如果指定大小則是有界的, 否則是無界的。 吞吐量高於 ArrayBlockingQueue
+ * PriorityBlockingQueue
+   任務按 priority 排序的無界 queue
+ * DelayQueue
+   基於 PriorityBlockingQueue 的 queue, priority 即是 delay time, 且只有 timeout 才可以出 queue, Executors.newScheduledThreadPool 使用的就是 DelayQueue。
+ * SynchronousQueue
+   SynchronousQueue 是比較特殊的 queue, 它不保存存 task, 並且收到任務後會直接創建新的 Thread 來執行任務, 在這個任務備取走之前, 其他的任務提交會被阻塞, 吞吐量高於 LinkedBlockingQueue, Executors.newCachedThreadPool 使用的就是 SynchronousQueue
+
+注意, 只有有界的 BlockingQueue 才會有機會觸發 RejectedExecutionHandler 的拒絕策略。
+
+** Hook Method
+ThreadPoolExecutor 在執行每個任務前、結束每個任務後、線程池中止前, 都會執行對應的 hook method:
+#+begin_src java
+    /**
+     * Method invoked prior to executing the given Runnable in the
+     * given thread.  This method is invoked by thread {@code t} that
+     * will execute task {@code r}, and may be used to re-initialize
+     * ThreadLocals, or to perform logging.
+     *
+     * <p>This implementation does nothing, but may be customized in
+     * subclasses. Note: To properly nest multiple overridings, subclasses
+     * should generally invoke {@code super.beforeExecute} at the end of
+     * this method.
+     *
+     * @param t the thread that will run task {@code r}
+     * @param r the task that will be executed
+     */
+    protected void beforeExecute(Thread t, Runnable r) { }
+
+    /**
+     * Method invoked upon completion of execution of the given Runnable.
+     * This method is invoked by the thread that executed the task. If
+     * non-null, the Throwable is the uncaught {@code RuntimeException}
+     * or {@code Error} that caused execution to terminate abruptly.
+     *
+     * <p>This implementation does nothing, but may be customized in
+     * subclasses. Note: To properly nest multiple overridings, subclasses
+     * should generally invoke {@code super.afterExecute} at the
+     * beginning of this method.
+     *
+     * <p><b>Note:</b> When actions are enclosed in tasks (such as
+     * {@link FutureTask}) either explicitly or via methods such as
+     * {@code submit}, these task objects catch and maintain
+     * computational exceptions, and so they do not cause abrupt
+     * termination, and the internal exceptions are <em>not</em>
+     * passed to this method. If you would like to trap both kinds of
+     * failures in this method, you can further probe for such cases,
+     * as in this sample subclass that prints either the direct cause
+     * or the underlying exception if a task has been aborted:
+     *
+     *  <pre> {@code
+     * class ExtendedExecutor extends ThreadPoolExecutor {
+     *   // ...
+     *   protected void afterExecute(Runnable r, Throwable t) {
+     *     super.afterExecute(r, t);
+     *     if (t == null && r instanceof Future<?>) {
+     *       try {
+     *         Object result = ((Future<?>) r).get();
+     *       } catch (CancellationException ce) {
+     *           t = ce;
+     *       } catch (ExecutionException ee) {
+     *           t = ee.getCause();
+     *       } catch (InterruptedException ie) {
+     *           Thread.currentThread().interrupt(); // ignore/reset
+     *       }
+     *     }
+     *     if (t != null)
+     *       System.out.println(t);
+     *   }
+     * }}</pre>
+     *
+     * @param r the runnable that has completed
+     * @param t the exception that caused termination, or null if
+     * execution completed normally
+     */
+    protected void afterExecute(Runnable r, Throwable t) { }
+
+    /**
+     * Method invoked when the Executor has terminated.  Default
+     * implementation does nothing. Note: To properly nest multiple
+     * overridings, subclasses should generally invoke
+     * {@code super.terminated} within this method.
+     */
+    protected void terminated() { }
+#+end_src
+ * beforeExecute
+   在線程執行任務之前會先執行的方法, 可用於重新初始化 ThreadLocal, 更新日誌紀錄, 開始計時, 更新 context 等。
+ * afterExecute
+   在線程執行任務之後執行的方法, 可用於清理 ThreadLocal, 更新日誌紀錄, 收集統計信息, 更新 context 等, 另外可以在此提前捕獲任務執行時捕獲的異常。
+** RejectedExecutionHandler
+線程池在兩種情況下會拒絕接受提交的任務:
+1. shutdown 被調用, 服務已經關閉
+2. BlockingQueue 是有界 queue, 且 queue 已經滿
+如果觸發 reject, 會執行 RejectedExecutionHandler 的方法:
+#+begin_src java
+public interface RejectedExecutionHandler {
+
+    /**
+     * Method that may be invoked by a {@link ThreadPoolExecutor} when
+     * {@link ThreadPoolExecutor#execute execute} cannot accept a
+     * task.  This may occur when no more threads or queue slots are
+     * available because their bounds would be exceeded, or upon
+     * shutdown of the Executor.
+     *
+     * <p>In the absence of other alternatives, the method may throw
+     * an unchecked {@link RejectedExecutionException}, which will be
+     * propagated to the caller of {@code execute}.
+     *
+     * @param r the runnable task requested to be executed
+     * @param executor the executor attempting to execute this task
+     * @throws RejectedExecutionException if there is no remedy
+     */
+    void rejectedExecution(Runnable r, ThreadPoolExecutor executor);
+}
+#+end_src
+ThreadPoolExecutor 的內部靜態類有實現以下拒絕的策略:
+ * AbortPolicy
+ * DiscardPolicy
+ * DiscardOldestPolicy
+ * CallerRunsPolicy
+*** AbortPolicy 和 DiscardPolicy
+AbortPolicy 是默認的策略, 拒絕時直接不允許新的任務提交, 並拋出異常, 而 DiscardPolicy 則是 AbortPolicy 的安靜版本, 只拒絕任務提交, 不過實際上是什麼都不做。
+#+begin_src java
+    /**
+     * A handler for rejected tasks that throws a
+     * {@code RejectedExecutionException}.
+     */
+    public static class AbortPolicy implements RejectedExecutionHandler {
+        /**
+         * Creates an {@code AbortPolicy}.
+         */
+        public AbortPolicy() { }
+
+        /**
+         * Always throws RejectedExecutionException.
+         *
+         * @param r the runnable task requested to be executed
+         * @param e the executor attempting to execute this task
+         * @throws RejectedExecutionException always
+         */
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+            throw new RejectedExecutionException("Task " + r.toString() +
+                                                 " rejected from " +
+                                                 e.toString());
+        }
+    }
+
+    /**
+     * A handler for rejected tasks that silently discards the
+     * rejected task.
+     */
+    public static class DiscardPolicy implements RejectedExecutionHandler {
+        /**
+         * Creates a {@code DiscardPolicy}.
+         */
+        public DiscardPolicy() { }
+
+        /**
+         * Does nothing, which has the effect of discarding task r.
+         *
+         * @param r the runnable task requested to be executed
+         * @param e the executor attempting to execute this task
+         */
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        }
+    }
+#+end_src
+*** DiscardOldestPolicy
+如果是因為 BlockingQueue 滿了而要拒絕任務提交, 則從 BlockingQueue 中拋棄第一個任務, 它同時是最老的任務:
+#+begin_src java
+    public static class DiscardOldestPolicy implements RejectedExecutionHandler {
+        /**
+         * Creates a {@code DiscardOldestPolicy} for the given executor.
+         */
+        public DiscardOldestPolicy() { }
+
+        /**
+         * Obtains and ignores the next task that the executor
+         * would otherwise execute, if one is immediately available,
+         * and then retries execution of task r, unless the executor
+         * is shut down, in which case task r is instead discarded.
+         *
+         * @param r the runnable task requested to be executed
+         * @param e the executor attempting to execute this task
+         */
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+            if (!e.isShutdown()) {
+                e.getQueue().poll();
+                e.execute(r);
+            }
+        }
+    }
+#+end_src
+注意 e.execute(r); 這一行, 它會立刻執行這個觸發拒絕的任務, 但實際上 execute 的行為是執行 workQueue.offer(command), 也就是說, 最新到來的任務還是會進 BlockingQueue:
+#+begin_src java
+    public void execute(Runnable command) {
+        if (command == null)
+            throw new NullPointerException();
+        /*
+         * Proceed in 3 steps:
+         *
+         * 1. If fewer than corePoolSize threads are running, try to
+         * start a new thread with the given command as its first
+         * task.  The call to addWorker atomically checks runState and
+         * workerCount, and so prevents false alarms that would add
+         * threads when it shouldn't, by returning false.
+         *
+         * 2. If a task can be successfully queued, then we still need
+         * to double-check whether we should have added a thread
+         * (because existing ones died since last checking) or that
+         * the pool shut down since entry into this method. So we
+         * recheck state and if necessary roll back the enqueuing if
+         * stopped, or start a new thread if there are none.
+         *
+         * 3. If we cannot queue task, then we try to add a new
+         * thread.  If it fails, we know we are shut down or saturated
+         * and so reject the task.
+         */
+        int c = ctl.get();
+        if (workerCountOf(c) < corePoolSize) {
+            if (addWorker(command, true))
+                return;
+            c = ctl.get();
+        }
+        if (isRunning(c) && workQueue.offer(command)) {
+            int recheck = ctl.get();
+            if (! isRunning(recheck) && remove(command))
+                reject(command);
+            else if (workerCountOf(recheck) == 0)
+                addWorker(null, false);
+        }
+        else if (!addWorker(command, false))
+            reject(command);
+    }
+#+end_src
+*** CallerRunsPolicy
+如果服務沒被關閉, 新到來的任務被拒絕, 則起一個另外的 Thread 去執行這個任務, 這個 thread 不是 ThreadPool 裡的 thread:
+#+begin_src java
+    /**
+     * A handler for rejected tasks that runs the rejected task
+     * directly in the calling thread of the {@code execute} method,
+     * unless the executor has been shut down, in which case the task
+     * is discarded.
+     */
+    public static class CallerRunsPolicy implements RejectedExecutionHandler {
+        /**
+         * Creates a {@code CallerRunsPolicy}.
+         */
+        public CallerRunsPolicy() { }
+
+        /**
+         * Executes task r in the caller's thread, unless the executor
+         * has been shut down, in which case the task is discarded.
+         *
+         * @param r the runnable task requested to be executed
+         * @param e the executor attempting to execute this task
+         */
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+            if (!e.isShutdown()) {
+                r.run();
+            }
+        }
+    }
+#+end_src
+
+** ThreadPoolExecutor 的任務提交
+ThreadPoolExecutor 的 submit 被實現在 AbstractExecutorService 裡面, 實際上只是包一層 FutureTask 後執行 execute:
+#+begin_src java
+
+    /**
+     * Returns a {@code RunnableFuture} for the given runnable and default
+     * value.
+     *
+     * @param runnable the runnable task being wrapped
+     * @param value the default value for the returned future
+     * @param <T> the type of the given value
+     * @return a {@code RunnableFuture} which, when run, will run the
+     * underlying runnable and which, as a {@code Future}, will yield
+     * the given value as its result and provide for cancellation of
+     * the underlying task
+     * @since 1.6
+     */
+    protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T value) {
+        return new FutureTask<T>(runnable, value);
+    }
+
+    /**
+     * Returns a {@code RunnableFuture} for the given callable task.
+     *
+     * @param callable the callable task being wrapped
+     * @param <T> the type of the callable's result
+     * @return a {@code RunnableFuture} which, when run, will call the
+     * underlying callable and which, as a {@code Future}, will yield
+     * the callable's result as its result and provide for
+     * cancellation of the underlying task
+     * @since 1.6
+     */
+    protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+        return new FutureTask<T>(callable);
+    }
+
+    /**
+     * @throws RejectedExecutionException {@inheritDoc}
+     * @throws NullPointerException       {@inheritDoc}
+     */
+    public Future<?> submit(Runnable task) {
+        if (task == null) throw new NullPointerException();
+        RunnableFuture<Void> ftask = newTaskFor(task, null);
+        execute(ftask);
+        return ftask;
+    }
+
+    /**
+     * @throws RejectedExecutionException {@inheritDoc}
+     * @throws NullPointerException       {@inheritDoc}
+     */
+    public <T> Future<T> submit(Runnable task, T result) {
+        if (task == null) throw new NullPointerException();
+        RunnableFuture<T> ftask = newTaskFor(task, result);
+        execute(ftask);
+        return ftask;
+    }
+
+    /**
+     * @throws RejectedExecutionException {@inheritDoc}
+     * @throws NullPointerException       {@inheritDoc}
+     */
+    public <T> Future<T> submit(Callable<T> task) {
+        if (task == null) throw new NullPointerException();
+        RunnableFuture<T> ftask = newTaskFor(task);
+        execute(ftask);
+        return ftask;
+    }
+#+end_src
+
+實際上真正執行任務的是 execute:
+#+begin_src java
+    public void execute(Runnable command) {
+        if (command == null)
+            throw new NullPointerException();
+        /*
+         * Proceed in 3 steps:
+         *
+         * 1. If fewer than corePoolSize threads are running, try to
+         * start a new thread with the given command as its first
+         * task.  The call to addWorker atomically checks runState and
+         * workerCount, and so prevents false alarms that would add
+         * threads when it shouldn't, by returning false.
+         *
+         * 2. If a task can be successfully queued, then we still need
+         * to double-check whether we should have added a thread
+         * (because existing ones died since last checking) or that
+         * the pool shut down since entry into this method. So we
+         * recheck state and if necessary roll back the enqueuing if
+         * stopped, or start a new thread if there are none.
+         *
+         * 3. If we cannot queue task, then we try to add a new
+         * thread.  If it fails, we know we are shut down or saturated
+         * and so reject the task.
+         */
+        int c = ctl.get();
+        if (workerCountOf(c) < corePoolSize) {
+            if (addWorker(command, true))
+                return;
+            c = ctl.get();
+        }
+        if (isRunning(c) && workQueue.offer(command)) {
+            int recheck = ctl.get();
+            if (! isRunning(recheck) && remove(command))
+                reject(command);
+            else if (workerCountOf(recheck) == 0)
+                addWorker(null, false);
+        }
+        else if (!addWorker(command, false))
+            reject(command);
+    }
+#+end_src
+** ThreadPoolExecutor 的狀態
+#+begin_src java
+    /**
+     * The main pool control state, ctl, is an atomic integer packing
+     * two conceptual fields
+     *   workerCount, indicating the effective number of threads
+     *   runState,    indicating whether running, shutting down etc
+     *
+     * In order to pack them into one int, we limit workerCount to
+     * (2^29)-1 (about 500 million) threads rather than (2^31)-1 (2
+     * billion) otherwise representable. If this is ever an issue in
+     * the future, the variable can be changed to be an AtomicLong,
+     * and the shift/mask constants below adjusted. But until the need
+     * arises, this code is a bit faster and simpler using an int.
+     *
+     * The workerCount is the number of workers that have been
+     * permitted to start and not permitted to stop.  The value may be
+     * transiently different from the actual number of live threads,
+     * for example when a ThreadFactory fails to create a thread when
+     * asked, and when exiting threads are still performing
+     * bookkeeping before terminating. The user-visible pool size is
+     * reported as the current size of the workers set.
+     *
+     * The runState provides the main lifecycle control, taking on values:
+     *
+     *   RUNNING:  Accept new tasks and process queued tasks
+     *   SHUTDOWN: Don't accept new tasks, but process queued tasks
+     *   STOP:     Don't accept new tasks, don't process queued tasks,
+     *             and interrupt in-progress tasks
+     *   TIDYING:  All tasks have terminated, workerCount is zero,
+     *             the thread transitioning to state TIDYING
+     *             will run the terminated() hook method
+     *   TERMINATED: terminated() has completed
+     *
+     * The numerical order among these values matters, to allow
+     * ordered comparisons. The runState monotonically increases over
+     * time, but need not hit each state. The transitions are:
+     *
+     * RUNNING -> SHUTDOWN
+     *    On invocation of shutdown(), perhaps implicitly in finalize()
+     * (RUNNING or SHUTDOWN) -> STOP
+     *    On invocation of shutdownNow()
+     * SHUTDOWN -> TIDYING
+     *    When both queue and pool are empty
+     * STOP -> TIDYING
+     *    When pool is empty
+     * TIDYING -> TERMINATED
+     *    When the terminated() hook method has completed
+     *
+     * Threads waiting in awaitTermination() will return when the
+     * state reaches TERMINATED.
+     *
+     * Detecting the transition from SHUTDOWN to TIDYING is less
+     * straightforward than you'd like because the queue may become
+     * empty after non-empty and vice versa during SHUTDOWN state, but
+     * we can only terminate if, after seeing that it is empty, we see
+     * that workerCount is 0 (which sometimes entails a recheck -- see
+     * below).
+     */
+    private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
+    private static final int COUNT_BITS = Integer.SIZE - 3;
+    private static final int CAPACITY   = (1 << COUNT_BITS) - 1;
+
+    // runState is stored in the high-order bits
+    private static final int RUNNING    = -1 << COUNT_BITS;
+    private static final int SHUTDOWN   =  0 << COUNT_BITS;
+    private static final int STOP       =  1 << COUNT_BITS;
+    private static final int TIDYING    =  2 << COUNT_BITS;
+    private static final int TERMINATED =  3 << COUNT_BITS;
+#+end_src
+ * RUNNING
+   ThreadPoolExecutor 創建好後, 可以提供服務的狀態
+ * SHUTDOWN
+   服務關閉的狀態
+ * STOP
+   服務關閉, 且開始中斷所有運行中的任務, 並清空 BlockingQueue
+ * TIDYING
+   服務關閉, 且沒有運行中的任務, 準備執行 hook method: terminated()
+ * TERMINATED
+   執行完 terminated() 後的狀態
+
+
+* Why Not Executors Factory Method
+** newFixedThreadPool 和 newSingleThreadExecutor
+newFixedThreadPool:
+#+begin_src java
+    public static ExecutorService newFixedThreadPool(int nThreads) {
+        return new ThreadPoolExecutor(nThreads, nThreads,
+                                      0L, TimeUnit.MILLISECONDS,
+                                      new LinkedBlockingQueue<Runnable>());
+    }
+#+end_src
+
+newSingleThreadExecutor()
+#+begin_src java
+    public static ExecutorService newSingleThreadExecutor() {
+        return new FinalizableDelegatedExecutorService
+            (new ThreadPoolExecutor(1, 1,
+                                    0L, TimeUnit.MILLISECONDS,
+                                    new LinkedBlockingQueue<Runnable>()));
+    }
+
+#+end_src
+
+newFixedThreadPool 和 newSingleThreadExecutor 最主要的問題是 LinkedBlockingQueue<Runnable>(), 這是一個無界 queue, ThreadPool 會將所有的任務提交 cache 在 LinkedBlockingQueue<Runnable>() 中, 直到 OOM
+
+** newCachedThreadPool 和 newScheduledThreadPool
+#+begin_src java
+    public static ExecutorService newCachedThreadPool() {
+        return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                                      60L, TimeUnit.SECONDS,
+                                      new SynchronousQueue<Runnable>());
+    }
+#+end_src
+
+#+begin_src java
+    public static ScheduledExecutorService newSingleThreadScheduledExecutor() {
+        return new DelegatedScheduledExecutorService
+            (new ScheduledThreadPoolExecutor(1));
+    }
+    public ScheduledThreadPoolExecutor(int corePoolSize) {
+        super(corePoolSize, Integer.MAX_VALUE, 0, NANOSECONDS,
+              new DelayedWorkQueue());
+    }
+#+end_src
+newCachedThreadPool 和 newScheduledThreadPool 的問題是 maximumPoolSize 是 Integer.MAX_VALUE, 沒有任務會被拒絕, 大量任務湧入時可能耗盡所有線程資源。

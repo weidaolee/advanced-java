@@ -1,0 +1,81 @@
+#+TITLE: Compare-And-Swap
+* Compare-And-Swap (CAS)
+由於重量級鎖是透過 OS 的 mutex_lock 實現的, 這是一種 system call, 會引發用戶態/內核態的切換, 因此開銷大、性能低。 而輕量級鎖是使用 Compare-and-Swap CAS 的方式自旋搶鎖, 這個過程是 CPU 指令級別的原子操作, 過程中不發生用戶態/內核態的切換, 因此開銷很低。 CAS 是一種無鎖的算法:
+1. 透過 Object 的 offset 得到要 CAS 操作的 attribute 在內存中的值 (Compare)
+2. 比較期望的值和內存中的值是否相等, 相等代表之前沒有其他人操作過, 可以對其進行賦值 (Swap)
+
+** Unsafe 類
+Unsafe 是 sun.misc 底下的一個類, 提供一些 low level 且 unsafe 的操作, 如直接訪問系統資源、自主管理內存資源等。 Unsafe 的方法大多都是 native 的方法, 基於 C++ 實現, 這些方法在提昇 Java 運行效率、增強底層資源操作能力上起到很大的作用, 但這些方法是不安全的, 開發中沒有特別的理由不應該使用 Unsafe 提供的方法。
+
+OS 層面的 CAS 是一條 CPU 指令級別的原子指令 *cmpxchg*, 由於 *cmpxchg* 具備 CPU 指令級別的原子性, 因此對數據操作時不會有數據不一致的問題, 避免了線程安全中的原子性問題。 Unsafe 提供的 CAS 方法是直接以 native 的方式用 C++ 封裝, 調用了底層的 *cmpxchg* 。
+
+完成 Java 應用層的 CAS 操作主要有以下步驟:
+1. 取得 Unsafe instance
+2. 調用 Unsafe 的 CAS 方法
+3. 調用 Unsafe 的 attribute 偏移量方法, 這些方法用於獲取 attribute 偏移量, 這些偏移量要提供給 CAS 方法作為參數
+
+*** 取得 Unsafe instance
+Unsafe 是一個 final 類, 是無法被繼承的, 而他的 constructor 也是 private 的, 如果要取得 Unsafe Object 要使用 reflection:
+
+#+begin_src java
+    private Unsafe() {
+    }
+
+    @CallerSensitive
+    public static Unsafe getUnsafe() {
+        Class var0 = Reflection.getCallerClass();
+        if (!VM.isSystemDomainLoader(var0.getClassLoader())) {
+            throw new SecurityException("Unsafe");
+        } else {
+            return theUnsafe;
+        }
+    }
+
+#+end_src
+
+以下是取得的範例:
+#+begin_src java
+public class UnsafeDemo {
+    public static Unsafe getUnsafe() {
+        try {
+            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            return (Unsafe) theUnsafe.get(null);
+        } catch (NoSuchFieldException e) {
+            e.printStackTrace();
+        } catch (IllegalAccessException e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+}
+#+end_src
+*** 調用 Unsafe 的 CAS 方法
+Unsafe 類的方法依賴下列四個參數:
+ * o 需要操作的 attribute 所在的對象
+ * offest 需要操作的 attribute 的偏移量, 相對於 o 的對象頭
+ * expected 期望的值
+ * update 更新的值
+
+Unsafe 提供了 3 種 CAS 操作:
+#+begin_src java
+
+    public final native boolean compareAndSwapObject(Object o, long offest, Object expected, Object update);
+
+    public final native boolean compareAndSwapInt(Object o, long offest, int expected, int update);
+
+    public final native boolean compareAndSwapLong(Object o, long offest, long expected, long update);
+#+end_src
+
+當調用 CAS 方法時, 首先會以內存中的值和 expected 的值做比較, 如果相同就將 update 值覆蓋內存中的值, 並 return true, 否則什麼都不做並返回 false, 表示 CAS 操作失敗
+
+*** 調用 Unsafe 的 attribute 偏移量方法
+#+begin_src java
+    public native long staticFieldOffset(Field field);
+
+    public native long objectFieldOffset(Field field);
+#+end_src
+** CAS 自旋示意
+假如現在某個對象的屬性在內存中的值為 100, 此時有兩個線程 A, B 分別使用 CAS 嘗試對其進行更新, 其中 A 線程要將該值更新為 200, B 則希望更新成 300:
+[[./image/cas-01.png]]
+由於 CAS 是原子操作, 因此 A 和 B 只有一個會成功執行, 我們假設 A 執行成功, 此時內存中的值會被更新成 200, 而 B CAS 失敗, 因此 B 只能自旋, 開始新的一輪循環, 這一輪循環會將 expected 的值改為 200, 然後進行 CAS(200, 300) 操作, 這次 B 的 CAS 操作會成功。

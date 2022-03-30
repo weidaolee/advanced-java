@@ -1,0 +1,77 @@
+#+TITLE: 重量級鎖與 Monitor
+JVM 中, 每個 Object 和 Class, 都唯一對應一個 Monitor。 Monitor 是一個同步機制, 重量級鎖透過 Monitor 保障了只有一個線程可以進入臨界區, 沒有進入臨界區的線程將被阻塞。重量級鎖也稱為 *同步鎖* 或者 *互斥鎖* 。
+* 重量級鎖原理: Monitor
+JVM 中, 每個對象都有自己的 Monitor, 它與這對象一起被創建與銷毀。 在 HotSpot JVM 中, Monitor 是透過 C++ 的 ObjectMonitor 實現的, ObjectMonitor 被定義在 ObjectMonitor.hpp 中, 其 constructor 大致如下:
+#+begin_src cpp
+ObjectMonitor::ObjectMonitor() {
+    _header       = NULL;
+    _count        = 0;
+    _waiters      = 0;
+
+    // 重入次數
+    _recursions   = 0;
+    _object       = NULL;
+
+    // 擁有 Monitor 的線程
+    _owner        = NULL;
+
+    // 等待隊列: 處於等待中的線程形成的雙向鏈表
+    _WaitSet      = NULL;
+    _WaitSetLock  = 0 ;
+    _Responsible  = NULL ;
+
+    _succ         = NULL ;
+
+    // 競爭隊列: 多線程競爭時的單向鏈表
+    cxq           = NULL ;
+    FreeNext      = NULL ;
+
+    // 入口隊列: _owner 從等待隊列喚醒線程
+    _EntryList    = NULL ;
+    _SpinFreq     = 0 ;
+    _SpinClock    = 0 ;
+    OwnerIsThread = 0 ;
+}
+#+end_src
+ObjectMonitor 中有三個隊列: cxq, _WaitSet, _EntryList
+** cxq: Contention Queue 競爭隊列
+Contention Queue 競爭隊列, 所有請求鎖的線程首先會被放在競爭隊列中。 競爭隊列並不是一個真實的隊列, 因為它實際上由 Node 及其對應的 next pointer 構成。 每次增加新的 Node, 會透過 CAS 替換從 cxq 的 head pointer, 同時將新的 head 的 next 指向原 head。 而 cxq 的 poll 只允許 owner 操作, 因此就避免了 CAS 的 ABA 問題。
+
+另外, 在線程進入 cxq 之前, 線程會先 CAS 自旋, 如果自旋失敗了, 才會進入 cxq 競爭隊列, 這顯然對於已經在 cxq 裡排隊的線程是不公平的, 因此重量級鎖是不公平鎖。
+** EntryList: 入口隊列
+Owner 在釋放鎖時, 會執行競爭隊列的 poll, 並將從競爭隊列移出的 Node 加入 EntryList 中, 並會指定 EntryList 中的一個線程為 OnDeck Thread (通常是 head), 成為 OnDeck Thread 代表自己是進入臨界區的候選者。
+
+注意, 從競爭隊列出來的線程並沒有直接成為 Owner, 而是成為 OnDeck Thread, OnDeck Thread 會參與競爭鎖, 獲得鎖的 OnDeck Thread 會晉升為新的 Owner, 而其他競爭失敗的則留在 EntryList 中。
+另外, 就算 OnDeck Thread 搶到了鎖, 準備晉升 Owner 時, 也有可能被處在競爭隊列之外、正在 CAS 自旋的線程自旋成功, 因而沒能成為 Owner。
+** WaitList: 等待隊列
+Owner 搶到鎖後, 有可能因為一些條件不滿足, 比如要獲取其他鎖, 而觸發了 Object.wait(), 此時 Owner 會進入 WaitList 等待隊列, 直到被 Object.notify() 或 Object.notifyAll() 喚醒。 被喚醒的線程會到 EntryList 中等待下一次競爭。
+* 重量級鎖的開銷
+處於 ContentionList, EntryList 以及 WaitList 的線程都屬於阻塞狀態, 而線程的阻塞與喚醒都需要靠 OS 來幫忙, Linux core 是透過 pthread_mutex_lock (system call) 實現的, 因此進程需要從用戶態切換到內核態。
+** Linux core
+所謂的 Linux core 是一系列特殊的程式, 它們工作於內核空間中, 這些程式負責調度硬件資源, 比如: 協調 CPU 資源, 份配內存等, 用於提供穩定的運行環境供應用程式運行。 而應用程式運行在 Linux core 提供的用戶空間中, 這個空間依賴於 Linux core 提供的資源。
+
+** Contex Switch 上下文切換
+用戶空間與內核空間有各自專用的內存、專用的寄存器等, 當進程從用戶態切換到內核態時, 需要傳遞大量的參數給 Linux core, Linux core 也要耗費資源來維持這些狀態, 以便切換回用戶態時, 應用程式能維持原來的狀態, 這樣的切換稱之為 Contex Switch 上下文切換。 一個處在用戶態的進程能夠訪問的資源受到極大的限制, 而一個處在內核態的進程可以 "為所欲為", 因為它的資源調度範圍的是整個 OS 能見的所有硬件資源。
+
+通常有三種情況, 會發生進程從用戶態切換到內核態:
+1. 硬件中斷
+   當硬件沒能完成用戶的請求時, 硬件會向 CPU 發中斷信號
+2. system call
+   system call 本身就是中斷, 屬於軟件中斷
+3. 異常
+   當用戶態的代碼觸發異常, 也會觸發中斷
+* 隱式鎖的膨脹機制
+本章所討論的鎖都屬於 *隱式鎖*, 它並不被 Java 語言控制, 而是 JVM 在底層 *隱式的* 完成。 而在 Java 語言層面我們僅僅透過 synchronized 關鍵字聲明互斥的資源。
+
+當線程發生競爭時, 這句話等價為: 線程想進入鎖對象的臨界區, 但是發現鎖狀態不是無鎖的。 此時:
+1. 如果是偏向鎖, 先確認鎖是否可偏向
+   檢查 Object 對象頭中的 Mark Word 字段 biased_lock 和 lock 字段。 如果 biased_lock = 1, lock = 01, 則代表可偏向。
+2. 如果可偏向, 確認自己是否為鎖偏好的線程
+   檢查 Object 對象頭中的 Mark Word 字段的 thread id 和自己是否相符。 如果相符, 直接進入臨界區。
+3. 如果自己不是偏向鎖偏好線程, 透過 CAS 競爭
+   如果 CAS 競爭成功, 則獲得偏向鎖, 進入臨界區。
+4. 如果 CAS 競爭失敗, 膨脹為輕量級鎖
+   執行偏向鎖註銷並膨脹為輕量級鎖。
+5. 如果線程處在輕量級鎖, CAS 自旋搶鎖
+   CAS 自旋搶鎖, 相當於將鎖對象中 Mark Word 的 ptr_to_lock_record 指向自己 frame stack 的 lock record, 如果成功則獲得輕量級鎖, 進入臨界區。
+6. 如果 CAS 自旋失敗, 膨脹為重量級鎖

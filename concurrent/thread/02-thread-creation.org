@@ -1,0 +1,281 @@
+#+TITLE: 線程的創建和啟動
+
+* extends Thread
+extends Thread, 並重寫 run():
+#+begin_src java
+class MyThread extends Thread {
+    @Override
+    public void run() {
+        //...
+    }
+}
+#+end_src
+
+start():
+#+begin_src java
+ public static void main(String args[]) throws InterruptedException {
+     Mythread myThread = new MyThread();
+
+     myThread.start();
+ }
+#+end_src
+
+* implement Runnable
+implement Runnable:
+#+begin_src java
+class A implements Runnable {
+    @Override
+    public void run() {
+        //...
+    }
+}
+#+end_src
+
+當要啟動線程時, 必須 new 一個 Thread 類, 並將有實現 Runnable 的 Object 傳給 Thread:
+#+begin_src java
+ public static void main(String args[]) throws InterruptedException {
+     Thread thread = new Thread(new A());
+
+     thread.start();
+ }
+#+end_src
+
+有時候我們要使用多線程, 但是 run() 的邏輯很簡單, 實在不值得寫出一個 class, 可以採用 Anonymous inner-class 或 Lambda。
+
+Anonymous inner-class:
+#+begin_src java
+ public static void main(String args[]) throws InterruptedException {
+     Thread thread = new Thread(new Runnable {
+             @Override
+             public void run() {
+                 //...
+             }
+         });
+
+     thread.start();
+ }
+#+end_src
+Lambda:
+#+begin_src java
+ public static void main(String args[]) throws InterruptedException {
+     Thread thread = new Thread(() -> {
+             // code
+     } );
+
+     thread.start();
+ }
+#+end_src
+注意, 如果 run() 需要成員變量或方法的參與時, 不應使用 implements Runnable 的方法, 這也是 strategy pattern 慎用的時機。
+* FutureTask
+** Future
+使用 extends Thread 或是 implements Runnable 方法都有個共同的缺陷: 沒有 return。 這是一個比較大的問題, 有時候我們需要獲取異步執行的結果。在 Java 1.5 後的 java.util.concurrent 開始引入了 Future,
+除了可以獲取返回值之外, Future 提供更規範、更完善的異步控制:
+1. 能取得返回值
+2. 能取消執行中的任務
+3. 能判斷任務是被取消還是被完成
+
+#+begin_src java
+public interface Future<V> {
+
+    /**
+     * Attempts to cancel execution of this task.  This attempt will
+     * fail if the task has already completed, has already been cancelled,
+     * or could not be cancelled for some other reason. If successful,
+     * and this task has not started when {@code cancel} is called,
+     * this task should never run.  If the task has already started,
+     * then the {@code mayInterruptIfRunning} parameter determines
+     * whether the thread executing this task should be interrupted in
+     * an attempt to stop the task.
+     *
+     * <p>After this method returns, subsequent calls to {@link #isDone} will
+     * always return {@code true}.  Subsequent calls to {@link #isCancelled}
+     * will always return {@code true} if this method returned {@code true}.
+     *
+     * @param mayInterruptIfRunning {@code true} if the thread executing this
+     * task should be interrupted; otherwise, in-progress tasks are allowed
+     * to complete
+     * @return {@code false} if the task could not be cancelled,
+     * typically because it has already completed normally;
+     * {@code true} otherwise
+     */
+    boolean cancel(boolean mayInterruptIfRunning);
+
+    /**
+     * Returns {@code true} if this task was cancelled before it completed
+     * normally.
+     *
+     * @return {@code true} if this task was cancelled before it completed
+     */
+    boolean isCancelled();
+
+    /**
+     * Returns {@code true} if this task completed.
+     *
+     * Completion may be due to normal termination, an exception, or
+     * cancellation -- in all of these cases, this method will return
+     * {@code true}.
+     *
+     * @return {@code true} if this task completed
+     */
+    boolean isDone();
+
+    /**
+     * Waits if necessary for the computation to complete, and then
+     * retrieves its result.
+     *
+     * @return the computed result
+     * @throws CancellationException if the computation was cancelled
+     * @throws ExecutionException if the computation threw an
+     * exception
+     * @throws InterruptedException if the current thread was interrupted
+     * while waiting
+     */
+    V get() throws InterruptedException, ExecutionException;
+
+    /**
+     * Waits if necessary for at most the given time for the computation
+     * to complete, and then retrieves its result, if available.
+     *
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the timeout argument
+     * @return the computed result
+     * @throws CancellationException if the computation was cancelled
+     * @throws ExecutionException if the computation threw an
+     * exception
+     * @throws InterruptedException if the current thread was interrupted
+     * while waiting
+     * @throws TimeoutException if the wait timed out
+     */
+    V get(long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException;
+}
+#+end_src
+
+注意 get() 和 get(long timeout, TimeUnit unit) 都是阻塞等待, 並且的簽名中包含了異常: InterruptedException, ExecutionException, TimeoutException 等。
+** RunnableFuture
+Future 是比 Runnable 更好的 interface, 但是它不能直接和 Thread 一起工作, 因為 Thread 接受的簽名是 Runnable, 因此我們要透過 RunnableFuture 來做橋接, 這是經典的 adapter pattern:
+#+begin_src java
+package java.util.concurrent;
+
+/**
+ * A {@link Future} that is {@link Runnable}. Successful execution of
+ * the {@code run} method causes completion of the {@code Future}
+ * and allows access to its results.
+ * @see FutureTask
+ * @see Executor
+ * @since 1.6
+ * @author Doug Lea
+ * @param <V> The result type returned by this Future's {@code get} method
+ */
+public interface RunnableFuture<V> extends Runnable, Future<V> {
+    /**
+     * Sets this Future to the result of its computation
+     * unless it has been cancelled.
+     */
+    void run();
+}
+#+end_src
+** FutureTask and Callable
+除了 RunnableFuture 之外, 我們需要一個和 Runnable 類似但是允許返回值的 interface, 這樣也能透過 strategy pattern 的方式實現:
+#+begin_src java
+package java.util.concurrent;
+
+/**
+ * A task that returns a result and may throw an exception.
+ * Implementors define a single method with no arguments called
+ * {@code call}.
+ *
+ * <p>The {@code Callable} interface is similar to {@link
+ * java.lang.Runnable}, in that both are designed for classes whose
+ * instances are potentially executed by another thread.  A
+ * {@code Runnable}, however, does not return a result and cannot
+ * throw a checked exception.
+ *
+ * <p>The {@link Executors} class contains utility methods to
+ * convert from other common forms to {@code Callable} classes.
+ *
+ * @see Executor
+ * @since 1.5
+ * @author Doug Lea
+ * @param <V> the result type of method {@code call}
+ */
+@FunctionalInterface
+public interface Callable<V> {
+    /**
+     * Computes a result, or throws an exception if unable to do so.
+     *
+     * @return computed result
+     * @throws Exception if unable to compute a result
+     */
+    V call() throws Exception;
+}
+
+#+end_src
+
+到目前為止, 我們討論的都是 interface, 而 FutureTask 是真正的 RunnableFuture 真正的實現類:
+[[./image/FutureTask-uml.png]]
+
+FutureTask 的 run():
+#+begin_src java
+    public void run() {
+        if (state != NEW || !UNSAFE.compareAndSwapObject(this, runnerOffset, null, Thread.currentThread()))
+            return;
+        try {
+            Callable<V> c = callable;
+            if (c != null && state == NEW) {
+                V result;
+                boolean ran;
+                try {
+                    result = c.call();
+                    ran = true;
+                } catch (Throwable ex) {
+                    result = null;
+                    ran = false;
+                    setException(ex);
+                }
+                if (ran)
+                    set(result);
+            }
+        } finally {
+            // runner must be non-null until state is settled to
+            // prevent concurrent calls to run()
+            runner = null;
+            // state must be re-read after nulling runner to prevent
+            // leaked interrupts
+            int s = state;
+            if (s >= INTERRUPTING)
+                handlePossibleCancellationInterrupt(s);
+        }
+    }
+#+end_src
+FutureTask 裡有一個 result, 在 run() 被調用時, 它會執行 call() 並以 result 接收 call 的返回結果; 當 call 執行完畢且沒有異常時, ran = true, 此時會 set(result):
+#+begin_src java
+    protected void set(V v) {
+        if (UNSAFE.compareAndSwapInt(this, stateOffset, NEW, COMPLETING)) {
+            outcome = v;
+            UNSAFE.putOrderedInt(this, stateOffset, NORMAL); // final state
+            finishCompletion();
+        }
+    }
+#+end_src
+這樣就可以透過 outcome 來獲取結果。
+
+** 使用 FutureTask
+#+begin_src java
+ public static void main(String args[]) throws InterruptedException {
+
+     FutureTask futureTask = new FutureTask(new Callable {
+             // code
+         });
+
+     Thread thread = new Thread(futuretask);
+
+     thread.start();
+
+     // do something
+
+     V result = futureTask.get();
+ }
+#+end_src
+具體的執行流程如下:
+[[./image/returnable-thread.png]]

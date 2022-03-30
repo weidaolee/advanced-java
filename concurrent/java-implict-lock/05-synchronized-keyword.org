@@ -1,13 +1,9 @@
-#+TITLE: 互斥鎖
-前面我們提到了 Java 內存模型提供了 happens-before 規則約束了 CPU 何時可以使用 cache, 以及 compiler 何時可以進行指令重排優化, 解決了可見性問題與有序性問題, 而原子性問題, 則需要靠互斥鎖來解決。原子性的根本問題是線程切換導致的, 而互斥鎖會在代碼中規劃出一個 *臨界區*, 使得 *在該臨界區內僅允許一個線程在執行, 且執行過程中不切換線程* 。 在 Java 中, 我們透過 synchronized 來控制上鎖與釋放鎖, 具體來說是 compiler 幫我們作到的。
-* 極簡鎖模型
-最基礎的鎖模型, 透過 *lock()*, *臨界區*, *unlock()* 組成。但是這種鎖模型忽略一個重要的問題, 鎖是用來保護具體資源的, 在極簡鎖模型中臨界區沒有表示被保護的資源具體是什麼。
-[[https://static001.geekbang.org/resource/image/3d/a2/3df991e7de14a788b220468836cd48a2.png]]
+#+TITLE: synchronized Keyword
+synchronized 關鍵字, 幾乎就等價於 Java 的 隱式鎖機制, 在 Java 代碼層面我們僅僅是使用了 synchronized 宣告要保護的資源, 而對象鎖的狀態是偏向鎖、自旋鎖、互斥鎖, 完全由 JVM 去控制。 本節我們將從語言層面來理解 synchronized 的使用方式。
+* synchronized 關鍵字與原子性問題
+synchronized keyword 能在一定程度上邦我們解決原子性問題。 原子性的根本問題是線程切換導致的, 當我們使用 synchronized keyword 時, 我們相當於在代碼中規劃出一個 *臨界區*, 使得 *在臨界區內僅允許一個線程在執行, 且執行過程中不切換線程, 從而保證臨界區內的操作是原子的。* 不過, 我在前面強調了 *一定程度上能解決*, 是因為要完整解決我們還需要 CAS 和原子類。
 
-* 改進後的鎖模型
-因此, 在改進的鎖模型中, *臨界區* 必須關聯一個被保護的資源, 並且上鎖時, 會先創建一把 *鎖* 來關聯這個被保護的資源。
-[[https://static001.geekbang.org/resource/image/28/2f/287008c8137a43fa032e68a0c23c172f.png]]
-* Java 的鎖機制: synchronized
+* synchronized 的使用方式
 synchronized 可以修飾方法, 或是一個 code block, 以下是操作範例:
 #+begin_src java
 class ExclusiveLockExample {
@@ -30,7 +26,7 @@ class ExclusiveLockExample {
     }
 }
 #+end_src
-* 鎖保護的資源
+* synchronized 修飾的對象
 如果 synchronized 修飾的是非靜態的方法, 則被鎖保護的對象則是對象實例本身, 代碼等價於:
 #+begin_src java
 class ExclusiveLockExample {
@@ -75,9 +71,8 @@ class SafeAdd {
 }
 #+end_src
 此時, 被保護的資源都是 this, 且讀/寫都是互相排他的且執行過程中不會切換線程, 這樣的代碼是線程安全的。
-* 鎖和受保護資源的關係
-鎖和受保護資源之間的關係非常重要, 從數量的角度來說他們之間是 1:N 的關係才會起作用。 也就是說, 一把鎖可以保護多個資源, 但是一個資源的不同鎖之間是不互斥的。
-我們對上述案例燒做修改, 我們將 val 改成靜態變量, 將 add 改為靜態方法, 考慮以下代碼是否有併發問題:
+* 鎖對象與臨界區
+當我們在使用 synchronized 時, 就是對某個對象上鎖, 而這個 synchronized 所規劃出的臨界區, 是相對於該上鎖對象的。 也就是說, 我們可以在不同的代碼對同一個對象上鎖, 這樣可以保證操作這些代碼時必須取得這把鎖, 如同上面的代碼。鎖對象和臨界區的關係非常重要, 我們對上述案例稍做修改, 我們將 val 改成靜態變量, 將 add 改為靜態方法, 考慮以下代碼是否有併發問題:
 #+begin_src java
 class SafeAdd {
     static int val = 0;
@@ -89,10 +84,9 @@ class SafeAdd {
     }
 }
 #+end_src
-這裡我們實際上是使用了兩把鎖來保護相同的資源, 兩把鎖分別是 this 和 SafeAdd.class, 受保護的資源是 val, 由於制式兩把不同的鎖, 所以鎖之間並不互斥. 因此存在可見性問題, 在內存模型中如下:
-[[https://static001.geekbang.org/resource/image/60/be/60551e006fca96f581f3dc25424226be.png]]
-* 用不同的鎖保護無相關的不同資源
-上面提到但是一個資源的不同鎖之間是不互斥的, 因此一個對象的不相關的屬性, 可以用不同的鎖來保護, 這麼做可以提昇併發性, 考慮以下代碼:
+我們在 get() 方法是針對 this 上鎖, 而對 add 方法是針對 SafeAdd.class 上鎖, 而在兩個方法體中, 我們都對一個 class 的 val 操作, 顯然這個 get() 是有問題的。
+* 用不同的鎖對象保護無相關的不同資源
+當我們對一個 Object 中的所有方法都使用 this 來上鎖時, 這樣任何對這個 Object 的操作都會被阻塞, 這樣做明顯不夠有效率; 因此, 當我們明確知道兩個臨界區在業務上是無關時, 我們可以用不同的鎖來保護, 這樣併發性就得到保障, 請考慮以下代碼:
 #+begin_src java
 class Account {}
 private final Object balanceLock = new Object();
@@ -123,8 +117,9 @@ void setPassword (String oldPassWord, String newPassword) {
     }
 }
 #+end_src
-* 一把鎖保護有關係的不同資源
-考慮以下代碼:
+
+* 一個鎖對象保護有關係的不同資源
+臨界區中, 被保護的只有臨界區上鎖的對象, 這點請銘記。 我們考慮以下代碼:
 #+begin_src java
 clas Account {
     private int balance;
@@ -136,7 +131,7 @@ clas Account {
     }
 }
 #+end_src
-我們想用一把鎖 this, 保護兩個資源, this.amount 和 target.amount, 但是這麼做是錯的, 因為以 this 作為鎖, 最多只能保護到自己的資源, 我們再考慮以下代碼:
+我們想透過對 this 上鎖來保護 transfer 操作, 但這麼做是錯的, 因為 this 只能保護自己, 當有人修改 target.balance 時是不會被阻塞的, 所以此時是存在併發安全問題的。 所以, 如果一個操作要保護兩個共享對象, 那麼他們必須使用相同的鎖。 我們可以要求在創建 Account 對象時, 要傳入一把鎖, 並用這把鎖保護 transfer():
 #+begin_src java
 class Account {
     private Object lock；
@@ -155,7 +150,7 @@ class Account {
     }
 }
 #+end_src
-我們要求在創建 instance 時必須傳入一把全局唯一對象作為鎖, 但是這樣做有個問題是, 創建 account 對象的代碼可能在多個 maven 工程之中, 這樣就沒有辦法傳入相同的對象了, 因此, 解決方案應該是使用 Account.class 作為 lock:
+這樣確實是安全的, 因為現在要能操作 transfer, 必須先取得這個 lock, 但是這樣做有個問題是, 創建 Account 對象的代碼可能在多個 maven 工程之中, 這樣就沒有辦法傳入相同的對象了, 因此, 解決方案應該是使用 Account.class 作為 lock:
 #+begin_src java
 class Account {
   private int balance;

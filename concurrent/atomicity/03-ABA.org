@@ -1,0 +1,195 @@
+#+TITLE: ABA 問題
+CAS 操作能不能成功, 取決於 Compare 操作對內存中的值和期望的值是否相同, 如果相同才能進行 Swap, 這樣的操作看似安全, 但是隱含所謂的 ABA 問題。
+* ABA 問題
+假設內存中的 V 值為 V0, A、B 線程嘗試 CAS(V0, V1), B 線程 CAS(V0, V2), 且 B 搶鎖成功, V 被更新成 V2, 但 B 又透過一些操作比如 CAS(V2, V0), 此時 A 線程如果再嘗試 CAS(V0, V1) 是合法的, 但不代表這個修改是沒問題的, A 所操作的 V0, 已經不是原來的 V0, 而是 B 修改後得到的 V0。
+
+ABA 問題尤其在對象引用上特別顯著, 我們可以爭奪冠軍的場景來說明:
+1. 可以獲得更高的 score 的 User 是 champion
+2. A, B 嘗試 CAS(user1, user2), A 搶鎖失敗處於自旋
+3. B CAS(user1, user2) 成功後, 由於分數變化, 又 CAS(user2, user1)
+4. A 此時 CAS(user1, user2) 這時的 champion 是有問題的
+
+解決 ABA 問題的思路有兩個:
+1. 版本號方案: 給數據額外增加一個版本號, 數據有修改後就 +1, CAS 時要比較期望值和版本號
+2. 修改則標記方案: 給數據額外增加一個是否被修改過的標記, CAS 時如果有備修改過就直接失敗並重設標記
+* 版本號方案: AtomicStampedReference
+** Pair
+AtomicStampedReference 有一個靜態內部類 Pair<T>, 用來保存 reference 和版本號 stamp:
+#+begin_src java
+/**
+ * An {@code AtomicStampedReference} maintains an object reference
+ * along with an integer "stamp", that can be updated atomically.
+ *
+ * <p>Implementation note: This implementation maintains stamped
+ * references by creating internal objects representing "boxed"
+ * [reference, integer] pairs.
+ *
+ * @since 1.5
+ * @author Doug Lea
+ * @param <V> The type of object referred to by this reference
+ */
+public class AtomicStampedReference<V> {
+
+    private static class Pair<T> {
+        final T reference;
+        final int stamp;
+        private Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
+        }
+        static <T> Pair<T> of(T reference, int stamp) {
+            return new Pair<T>(reference, stamp);
+        }
+    }
+
+    private volatile Pair<V> pair;
+
+    /**
+     * Creates a new {@code AtomicStampedReference} with the given
+     * initial values.
+     *
+     * @param initialRef the initial reference
+     * @param initialStamp the initial stamp
+     */
+    public AtomicStampedReference(V initialRef, int initialStamp) {
+        pair = Pair.of(initialRef, initialStamp);
+    }
+//...
+#+end_src
+這個 Pair 實現有以下重點:
+1. constructor 被 private 修飾, 只能透過暴露的 of 來創建新的 pair 實例
+2. private volatile Pair<V> pair; 保證了內存可見性
+3. AtomicStampedReference 以 aggregate 的方式 has-a pair 對象
+** CAS
+AtomicStampedReference 的 CAS, 要比較內存中的 pair (current) 和期望的 pair 是否相等:
+#+begin_src java
+    /**
+     * Atomically sets the value of both the reference and stamp
+     * to the given update values if the
+     * current reference is {@code ==} to the expected reference
+     * and the current stamp is equal to the expected stamp.
+     *
+     * @param expectedReference the expected value of the reference
+     * @param newReference the new value for the reference
+     * @param expectedStamp the expected value of the stamp
+     * @param newStamp the new value for the stamp
+     * @return {@code true} if successful
+     */
+    public boolean compareAndSet(V   expectedReference,
+                                 V   newReference,
+                                 int expectedStamp,
+                                 int newStamp) {
+        Pair<V> current = pair;
+        return
+            expectedReference == current.reference && expectedStamp == current.stamp &&
+            ((newReference == current.reference &&
+              newStamp == current.stamp) ||
+             casPair(current, Pair.of(newReference, newStamp)));
+    }
+//...
+#+end_src
+return 的部份:
+1. 首先保證了 reference 和 stamp 都要相等, 否則 return false
+2. 再來, 如果要更新的 pair 和當前的 pair 也相等, 沒有東西需要被更新, return true 但什麼都不做
+3. 否則執行 casPair, 這是對 Unsafe 的 CAS 的封裝
+** Example
+我們先將期望的結果展示一下:
+B: before 500ms, ref:0, stamp:0
+A: before 1000ms, ref:0, stamp:0
+
+B: after 500ms, CAS(0, 1):true, ref:1, stamp:1
+B: after 500ms, CAS(1, 0):true, ref:0, stamp:2
+A: after 1000ms, CAS(0, 1):false, ref:0, stamp:2
+
+這樣的結果說明, 即便 A 的 reference 值相同, 如果 stamp 不同, CAS 操作會失敗, 以下是實現:
+#+begin_src java
+public class StampedReferenceDemo {
+    static AtomicStampedReference<Integer> refInteger = new AtomicStampedReference<>(0, 0);
+    static ExecutorService pool = Executors.newFixedThreadPool(2);
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(2);
+        pool.submit(() -> {
+            boolean success = false;
+            int stamp = refInteger.getStamp();
+            System.out.println("B: before 500ms, " + "ref:" + refInteger.getReference() + ", stamp:" + refInteger.getStamp());
+            try {
+                sleep(500);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            success = refInteger.compareAndSet(0, 1, stamp, stamp + 1);
+            System.out.println("B: after 500ms, CAS(0, 1):" + success + ", ref:" + refInteger.getReference() + ", stamp:" + refInteger.getStamp());
+
+            stamp ++;
+            success = refInteger.compareAndSet(1, 0, stamp, stamp + 1);
+            System.out.println("B: after 500ms, CAS(1, 0):" + success + ", ref:" + refInteger.getReference() + ", stamp:" + refInteger.getStamp());
+
+            latch.countDown();
+        });
+        pool.submit(() -> {
+            boolean success = false;
+            int stamp = refInteger.getStamp();
+            System.out.println("A: before 1000ms, " + "ref:" + refInteger.getReference() + ", stamp:" + refInteger.getStamp());
+            System.out.println();
+            try {
+                sleep(1000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            success = refInteger.compareAndSet(0, 1, stamp, stamp + 1);
+            System.out.println("A: after 1000ms, CAS(0, 1):" + success + ", ref:" + refInteger.getReference() + ", stamp:" + refInteger.getStamp());
+            latch.countDown();
+        });
+        pool.shutdown();
+    }
+}
+#+end_src
+* 修改則標記方案: AtomicMarkableReference
+AtomicMarkableReference 的實現和 AtomicStampedReference 幾乎相同, 區別是 int stamp 被改成 boolean mark, 如果有修改過, 則標記則要修改為 true
+B: before 500ms, ref:0, marked:false
+A: before 1000ms, ref:0, marked:false
+
+B: after 500ms, CAS(0, 1):true, ref:1, marked:true
+B: after 500ms, CAS(1, 0):true, ref:0, marked:true
+A: after 1000ms, CAS(0, 1):false, ref:0, marked:true
+#+begin_src java
+public class MarkableReferenceDemo {
+    static AtomicMarkableReference<Integer> refInteger = new AtomicMarkableReference<>(0, false);
+    static ExecutorService pool = Executors.newFixedThreadPool(2);
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(2);
+        pool.submit(() -> {
+            boolean success = false;
+            boolean marked = !refInteger.isMarked();
+            System.out.println("B: before 500ms, " + "ref:" + refInteger.getReference() + ", marked:" + refInteger.isMarked());
+            try {
+                sleep(500);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            success = refInteger.compareAndSet(0, 1, !marked, marked);
+            System.out.println("B: after 500ms, CAS(0, 1):" + success + ", ref:" + refInteger.getReference() + ", marked:" + refInteger.isMarked());
+
+            success = refInteger.compareAndSet(1, 0, marked, marked);
+            System.out.println("B: after 500ms, CAS(1, 0):" + success + ", ref:" + refInteger.getReference() + ", marked:" + refInteger.isMarked());
+
+            latch.countDown();
+        });
+        pool.submit(() -> {
+            boolean success = false;
+            boolean marked = !refInteger.isMarked();
+            System.out.println("A: before 1000ms, " + "ref:" + refInteger.getReference() + ", marked:" + refInteger.isMarked());
+            System.out.println();
+            try {
+                sleep(1000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            success = refInteger.compareAndSet(0, 1, !marked, marked);
+            System.out.println("A: after 1000ms, CAS(0, 1):" + success + ", ref:" + refInteger.getReference() + ", marked:" + refInteger.isMarked());
+            latch.countDown();
+        });
+        pool.shutdown();
+    }
+}
+#+end_src

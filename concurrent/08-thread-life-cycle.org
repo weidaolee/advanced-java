@@ -20,7 +20,7 @@
 * Java 線程的生命週期
 Java 線程的生命週期和通用線程的生命週期的不同點在於, Java 線程的生命週期面向的是 JVM, 而通用線程的生命週期面向的是 OS。
 
-Java 線程的生命週期有六種狀態, 其中 *NEW* 對應的是 *初始化狀態*, *TERMINATED* 對應的是 *中止態*, 而 *可運行態* 和 *運行態* 被合併成 *RUNNABLE 可運行態*, 意思是線程可運行/正在運行, 具體是哪種要看操作系統如何調度, 而 *休眠態* 則是細化成三種: *BLOCKED 阻塞中* 、 *WAITING 無限等待中* 、 *TIME_WAITING 有限等待中*, 所以 Java 線程的生命週期可以這樣表示:
+Java 線程的生命週期有六種狀態, 其中 *NEW* 對應的是 *初始化狀態*, 當 Thread 類的 Object 被創建後就處於 NEW 狀態, 這是 Java 層面上的狀態, 在 OS 層面還沒被準備好。 *TERMINATED* 對應的是 *中止態*, 而 *可運行態* 和 *運行態* 被合併成 *RUNNABLE 可運行態*, 意思是線程可運行/正在運行, 具體是哪種要看操作系統如何調度, 而 *休眠態* 則是細化成三種: *BLOCKED 阻塞中* 、 *WAITING 無限等待中* 、 *TIME_WAITING 有限等待中*, 所以 Java 線程的生命週期可以這樣表示:
 [[https://static001.geekbang.org/resource/image/3f/8c/3f6c6bf95a6e8627bdf3cb621bbb7f8c.png]]
 
 ** NEW to RUNNABLE

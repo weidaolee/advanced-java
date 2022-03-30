@@ -1,0 +1,528 @@
+#+TITLE: Thread-Local Storage
+* ThreadLocal 基本使用
+ThreadLocal 位於 java.lang 中。 如果我們在程序中創建了 ThreadLocal 的 instance, 那麼在訪問這個變量時, 每個線程都會擁有一個獨立的、自己的本地複本。 ThreadLocal variable 是專屬該線程的變量, 不受其他線程的干擾, 當線程結束後, 每個線程擁有的 ThreadLocal 的複本會被釋放掉, 每個線程只對各自的複本操作, 從而避免線程安全問題。
+
+ThreadLocal 可以理解為一個 Map (早期的 ThreadLocal 確實是這樣設計的), Map 的 key 是 instance, value 則是要保存的值。 當有線程要獲取 ThreadLocal variable 的值時, 就透過 instance 找到 value。
+
+當我們要使用 LocalData variable 時, 我們要先建立 ThreadLocal 對象, 在使用時只須透過 ThreadLocal.get() 來獲得對象值, 並且我們在 run() 中對變量的操作, 都僅是該線程可見的, 都屬於是該線程的本地操作。
+
+ThreadLocal 變量有 3 種操作, 都是只對該線程的複本操作:
+1. ThreadLocal.get()
+2. ThreadLocal.set()
+3. ThreadLocal.remove()
+
+下面是線程操作 ThreadLocal 的範例, 我們要先建立 ThreadLocal 對象 LOCAL_DATA, 並在多線程操作中都取得該對象的值, 並對變量值做修改, 結果可以看到這些修改僅是該線程可見的:
+#+begin_src java
+public class ThreadLocalDemo {
+    static class LocalData {
+        static final AtomicInteger AMOUNT = new AtomicInteger(0);
+        int id = 0;
+        int data = 0;
+        public LocalData() {
+            id = AMOUNT.incrementAndGet();
+        }
+        @Override
+        public String toString() {
+            return id + "@LocalData{data = " + data + "}";
+        }
+    }
+
+    private static final ThreadLocal<LocalData> LOCAL_DATA = new ThreadLocal<>();
+
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newCachedThreadPool();
+        for (int i = 0; i < 5; i++) {
+            pool.execute(new Runnable() {
+                @Override
+                public void run() {
+                    if (LOCAL_DATA.get() == null)
+                        LOCAL_DATA.set(new LocalData());
+                    System.out.println("Get Initial Thread Local Data:" + LOCAL_DATA.get());
+                    for (int j = 0; j < 10; j++) {
+                        LocalData localData = LOCAL_DATA.get();
+                        localData.data += 1;
+                        try {
+                            sleep(10);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                    System.out.println("Add Local Data 10 Times:" + LOCAL_DATA.get());
+                    LOCAL_DATA.remove();
+                }
+            });
+        }
+        pool.shutdown();
+    }
+}
+#+end_src
+執行結果如下:
+Get Initial Thread Local Data:1@LocalData{data = 0}
+Get Initial Thread Local Data:3@LocalData{data = 0}
+Get Initial Thread Local Data:5@LocalData{data = 0}
+Get Initial Thread Local Data:4@LocalData{data = 0}
+Get Initial Thread Local Data:2@LocalData{data = 0}
+Add Local Data 10 Times:3@LocalData{data = 10}
+Add Local Data 10 Times:5@LocalData{data = 10}
+Add Local Data 10 Times:1@LocalData{data = 10}
+Add Local Data 10 Times:4@LocalData{data = 10}
+Add Local Data 10 Times:2@LocalData{data = 10}
+
+執行結果要提個重點: id 值始終一致, 並且 data 最終值都是 10。 這說明了每個線程操作的是相同的本地值。
+
+在尚未給 LOCAL_DATA 綁定值時, 透過 LOCAL_DATA.get() 得到的值是 null, 因此我們需要在代碼中判空則綁定:
+#+begin_src java
+   if (LOCAL_DATA.get() == null)
+       LOCAL_DATA.set(new LocalData());
+#+end_src
+
+如果不想在每個線程都做這件事, 可以在創建 ThreadLocal 對象時, 透過 ThreadLocal 提供的靜態工廠方法 ThreadLocal.withInitial 綁定:
+#+begin_src java
+// private static final ThreadLocal<LocalData> LOCAL_DATA = new ThreadLocal<>();
+private static final ThreadLocal<LocalData> LOCAL_DATA = ThreadLocal.withInitial(() -> new LocalData());
+#+end_src
+
+* ThreadLocal 使用場景
+ThreadLocal 是透過將共享變量本地化的方式來解決線程安全的問題; 由於沒有共享, 所以線程之間是獨立的, 不需要鎖與同步機制參與, 這是一種無鎖的解決方案, 是一種併發性能非常好的解決方案, 這種解決方案適用於兩種場景, 一種是線程隔離, 一種是跨數傳遞數據。
+** 線程隔離
+ThreadLocal 很直接效果是是線程隔離, 這相當適合用於處理數據庫連接和維持 Session 的場景, 因為每一個連接與 session 是互相獨立的。 另外線程隔離的應用場景包含了位線程綁定了專屬的: Session context, 數據庫連接, HTTP 請求等等。
+
+以下的範例來自 Hibernet 的 getSession 於源碼:
+#+begin_src java
+private static final ThreadLocal threadSession = new ThreadLocal<>();
+public static Session getSession() throws InfrastructureException {
+    Session s = (Session) threadSession.get();
+
+    try {
+        if (s == null) {
+            s = getSessionFactory().openSession();
+            threadSession.set(s);
+        } catch (HibernateException ex) {
+            throw new InfrastructureException(ex);
+        }
+    }
+
+    return s;
+}
+#+end_src
+
+Hibernet 對數據庫連接獲取 session 進行封裝, 一個 Session 對象是一個連接。 以上的代碼可以看到, 首先會判斷當前線程有沒有 Session 對象, 如果沒有, 則會透過 getSessionFactory 開啟一個 Session, 如果已經有 Session 對象, 會直接返回 ThreadLocal 中的 Session 對象, 這個 Session 對象屬於該線程專屬的, 也就是說: 當沒有 Session 時開啟新的 Session, 當已經有 Session 時, 獲得本地的 Session。
+** 跨類、跨函數傳遞數據
+有時候跨類、跨函數傳遞數據時, 會提高類之間的耦合度, 如果這種傳遞是線程封閉的, 也就是說, 這種傳遞是僅一個線程可見的, 那麼使用 ThreadLocal 來傳遞參數, 可以大大降低耦合度, 同時又能作到線程安全。 這種案例有很多, 比如:
+1. 傳遞發起請求的用戶信息
+2. 傳遞發起請求的 Session 信息
+3. 傳遞 HTTP 的 HttpRequest
+
+以下範例來自 Crazy-SpringCloud 工程, 通過 ThreadLocal 在函數間傳遞用戶信息、 Session 信息等, 並且封裝成一個獨立的 SessionHolder:
+#+begin_src java
+public class SessionHolder {
+    private static final ThreadLocal<String> sidLocal = new ThreadLocal<>("sidLocal");
+    private static final ThreadLocal<UserDTO> sessionUserLocal = new ThreadLocal<>("sessionUserLocal");
+    private static final ThreadLocal<HttpSession> sessionLocal = new ThreadLocal<>("sessionLocal");
+    // ...
+    public static void setSession(HttpSession session) {
+        sessionLocal.set(session);
+    }
+    public static HttpSession getSession() {
+        HttpSession session = sessionLocal.get();
+        Assert.notNull(session, "session未设置");
+        return session;
+    }
+    //...
+}
+#+end_src
+範例中, SessionHolder 每個 SessionHolder 封裝了大量只與當前連接相關的數據, 然後暴露了訪問這些數據的方法, 這些數據都是 ThreadLocal 的數據, 因此任何線程在訪問這些數據時, 都是訪問線程專屬的數據。
+
+* ThreadLocal source code
+** ThreadLocal 內部結構演進
+ThreadLocal 是透過 Map, 以 instance 作為 key, 線程在 ThreadLocal 中綁定的值是 value。 在 JDK 1.8 以前的版本, 這個 Map 由 ThreadLocal 擁有, 每一個 ThreadLocal 擁有一個 Map instance, 在 JDK 1.8 以後, 每一個 Thread 擁有一個 Map (ThreadLocalMap), 如果我們建立多個 ThreadLocal 對象, 則 ThreadLocalMap 的 K-V pairs 則是這些 ThreadLocal 的 instance 和 value。
+
+而 ThreadLocal 類則負責 ThreadLocalMap 的創建、維護、存取等, 因此代碼依然在 ThreadLocal 類而不是 Thread 類, 只是 ThreadLocalMap 以 owns-a 的關係被 composite 到 Thread Object 裡。 以下是兩種版本的差異:
+1. Owner 不同, 舊版的是 ThreadLocal, 新版的 owner 是 Thread
+2. Key 不同, 舊版的是 Thread, 新版的是 ThreadLocal instance
+
+早期版本的問題是, 當 Thread 的數量多的時候, ThreadLocalMap 的 K-V pairs 也多, 並且 K-V pairs 的生命週期由 ThreadLocal 維護, 和 Thread 是分離的, 如果 Thread 銷毀了, K-V pairs 可能依然還在。 新版的 ThreadLocalMap 是 Thread 的一部分, K-V pairs 的數量只跟有多少 ThreadLocal variables 有關, 和 Thread 數量無關, 並且和 Thread 共用相同的生命週期。
+** set
+我們可以看到 set 首先獲取當前 Thread t, 然後透過 getMap 獲取 t 的 ThreadLocalMap, 如果這個 ThreadLocalMap 不為 null, 則做 set 操作, 否則會為它建立一個 ThreadLocalMap:
+#+begin_src java
+    /**
+     * Sets the current thread's copy of this thread-local variable
+     * to the specified value.  Most subclasses will have no need to
+     * override this method, relying solely on the {@link #initialValue}
+     * method to set the values of thread-locals.
+     *
+     * @param value the value to be stored in the current thread's copy of
+     *        this thread-local.
+     */
+    public void set(T value) {
+        Thread t = Thread.currentThread();
+        ThreadLocalMap map = getMap(t);
+        if (map != null)
+            map.set(this, value);
+        else
+            createMap(t, value);
+    }
+#+end_src
+
+我們可以看到 getMap 只是 return 我們傳進去的 Thread t 的 threadLocals, 也就是 Thread composite 的 ThreadLocalMap 就是 threadLocals:
+#+begin_src java
+    /**
+     * Get the map associated with a ThreadLocal. Overridden in
+     * InheritableThreadLocal.
+     *
+     * @param  t the current thread
+     * @return the map
+     */
+    ThreadLocalMap getMap(Thread t) {
+        return t.threadLocals;
+    }
+#+end_src
+
+而為線程 createMap 也只是將傳進去的 Thread t 創建真的 ThreadLocalMap 對象:
+#+begin_src java
+    /**
+     * Create the map associated with a ThreadLocal. Overridden in
+     * InheritableThreadLocal.
+     *
+     * @param t the current thread
+     * @param firstValue value for the initial entry of the map
+     */
+    void createMap(Thread t, T firstValue) {
+        t.threadLocals = new ThreadLocalMap(this, firstValue);
+    }
+#+end_src
+
+從 set 的實現我們可以知道, 就算我們重新 set 了 ThreadLocal 的值, 也只能影響當前線程, 並不能影響其他線程以及其他未來的線程。
+** setInitialValue
+注意, set 的邏輯把判斷是否有 initial 一個 ThreadLocalMap 的邏輯封裝了, 所以如果我們 override 了 set, 有可能會有問題, 因此 ThreadLocal 提供了 setInitialValue 方法:
+#+begin_src java
+    /**
+     * Variant of set() to establish initialValue. Used instead
+     * of set() in case user has overridden the set() method.
+     *
+     * @return the initial value
+     */
+    private T setInitialValue() {
+        T value = initialValue();
+        Thread t = Thread.currentThread();
+        ThreadLocalMap map = getMap(t);
+        if (map != null)
+            map.set(this, value);
+        else
+            createMap(t, value);
+        return value;
+    }
+#+end_src
+
+*注意, ThreadLocalMap 如果有這個值, 它會以 initialValue() 的值覆蓋當前的值。* 我們可以 override initialValue() 來指定要設置的 initialValue:
+#+begin_src java
+    /**
+     * Returns the current thread's "initial value" for this
+     * thread-local variable.  This method will be invoked the first
+     * time a thread accesses the variable with the {@link #get}
+     * method, unless the thread previously invoked the {@link #set}
+     * method, in which case the {@code initialValue} method will not
+     * be invoked for the thread.  Normally, this method is invoked at
+     * most once per thread, but it may be invoked again in case of
+     * subsequent invocations of {@link #remove} followed by {@link #get}.
+     *
+     * <p>This implementation simply returns {@code null}; if the
+     * programmer desires thread-local variables to have an initial
+     * value other than {@code null}, {@code ThreadLocal} must be
+     * subclassed, and this method overridden.  Typically, an
+     * anonymous inner class will be used.
+     *
+     * @return the initial value for this thread-local
+     */
+    protected T initialValue() {
+        return null;
+    }
+#+end_src
+** get
+get 會以 getEntry 的方式 return ThreadLocalMap 的值:
+#+begin_src java
+    /**
+     * Returns the value in the current thread's copy of this
+     * thread-local variable.  If the variable has no value for the
+     * current thread, it is first initialized to the value returned
+     * by an invocation of the {@link #initialValue} method.
+     *
+     * @return the current thread's value of this thread-local
+     */
+    public T get() {
+        Thread t = Thread.currentThread();
+        ThreadLocalMap map = getMap(t);
+        if (map != null) {
+            ThreadLocalMap.Entry e = map.getEntry(this);
+            if (e != null) {
+                @SuppressWarnings("unchecked")
+                T result = (T)e.value;
+                return result;
+            }
+        }
+        return setInitialValue();
+    }
+#+end_src
+
+注意, 如果 map is null, 或是 map 中沒有這個 K-V pairs, 則會 return setInitialValue(), 所以要注意, 如果我們 override 了 setInitialValue, 相當於 get 失敗就會設置 initial value 。
+** remove
+remove 用於 ThreadLocal 的清除, 用於當 Thread 的生命週期尚未結束時, 需要清除 threadLocals, 比如說: 線程池的 Thread 完成 execute 的 task, 但是並沒有要立刻銷毀 Thread, 此時和該 Thread 相關的 ThreadLocals 就應該被除, 可以在 ThreadPoolExecutor 的 hook 裡調用:
+#+begin_src java
+    /**
+     * Removes the current thread's value for this thread-local
+     * variable.  If this thread-local variable is subsequently
+     * {@linkplain #get read} by the current thread, its value will be
+     * reinitialized by invoking its {@link #initialValue} method,
+     * unless its value is {@linkplain #set set} by the current thread
+     * in the interim.  This may result in multiple invocations of the
+     * {@code initialValue} method in the current thread.
+     *
+     * @since 1.5
+     */
+     public void remove() {
+         ThreadLocalMap m = getMap(Thread.currentThread());
+         if (m != null)
+             m.remove(this);
+     }
+
+#+end_src
+
+注意, 真正的 remove 被封裝到 ThreadLocalMap 裡面 (是 ThreadLocal 的靜態內部類):
+#+begin_src java
+        /**
+         * Remove the entry for key.
+         */
+        private void remove(ThreadLocal<?> key) {
+            Entry[] tab = table;
+            int len = tab.length;
+            int i = key.threadLocalHashCode & (len-1);
+            for (Entry e = tab[i];
+                 e != null;
+                 e = tab[i = nextIndex(i, len)]) {
+                if (e.get() == key) {
+                    e.clear();
+                    expungeStaleEntry(i);
+                    return;
+                }
+            }
+        }
+#+end_src
+** withInitial
+在 JDK 1.8 以後, 對於 setInitialValue 提供了 withInitial 靜態工廠方法, 這個方法會 return 一個繼承了 ThreadLocal 的 subclass SuppliedThreadLocal:
+#+begin_src java
+    /**
+     * Creates a thread local variable. The initial value of the variable is
+     * determined by invoking the {@code get} method on the {@code Supplier}.
+     *
+     * @param <S> the type of the thread local's value
+     * @param supplier the supplier to be used to determine the initial value
+     * @return a new thread local variable
+     * @throws NullPointerException if the specified supplier is null
+     * @since 1.8
+     */
+    public static <S> ThreadLocal<S> withInitial(Supplier<? extends S> supplier) {
+        return new SuppliedThreadLocal<>(supplier);
+    }
+
+#+end_src
+
+SuppliedThreadLocal 是 ThreadLocal 的內部 static final class, 並且 extends 了 ThreadLocal 並 override 了 initialValue:
+#+begin_src java
+    static final class SuppliedThreadLocal<T> extends ThreadLocal<T> {
+
+        private final Supplier<? extends T> supplier;
+
+        SuppliedThreadLocal(Supplier<? extends T> supplier) {
+            this.supplier = Objects.requireNonNull(supplier);
+        }
+
+        @Override
+        protected T initialValue() {
+            return supplier.get();
+        }
+    }
+#+end_src
+
+這個 supplier 只是為了能捕獲 NullPointerException:
+#+begin_src java
+    /**
+     * Checks that the specified object reference is not {@code null} and
+     * throws a customized {@link NullPointerException} if it is.
+     *
+     * <p>Unlike the method {@link #requireNonNull(Object, String)},
+     * this method allows creation of the message to be deferred until
+     * after the null check is made. While this may confer a
+     * performance advantage in the non-null case, when deciding to
+     * call this method care should be taken that the costs of
+     * creating the message supplier are less than the cost of just
+     * creating the string message directly.
+     *
+     * @param obj     the object reference to check for nullity
+     * @param messageSupplier supplier of the detail message to be
+     * used in the event that a {@code NullPointerException} is thrown
+     * @param <T> the type of the reference
+     * @return {@code obj} if not {@code null}
+     * @throws NullPointerException if {@code obj} is {@code null}
+     * @since 1.8
+     */
+    public static <T> T requireNonNull(T obj, Supplier<String> messageSupplier) {
+        if (obj == null)
+            throw new NullPointerException(messageSupplier.get());
+        return obj;
+    }
+#+end_src
+
+注意, SuppliedThreadLocal 繼承了 ThreadLocal, 因此它有 get() 方法, 而這裡 SuppliedThreadLocal 的 constructor 嘗試拋出 NullPointerException 失敗後, override initialValue 這個方法, 而在使用 withInitial 時:
+#+begin_src java
+private static final ThreadLocal<LocalData> LOCAL_DATA = ThreadLocal.withInitial(() -> new LocalData());
+#+end_src
+
+也就是說, 當我們調用 withInitial 時, 實際上是透過靜態工廠方法獲得了一個覆蓋了 initialValue 的 SuppliedThreadLocal 類, 這也是我們要在創建 ThreadLocal 對象時調用 withInitial 的原因: 它要 return 一個 ThreadLocal 的 subclass, 這裡是靜態工廠方法的經典場景, 即 *將對象的創建推遲到子類完成* 。
+
+* ThreadLocalMap source code
+ThreadLocalMap 並沒有 implements Map, 而是自己實現了一套簡單的 HashMap 機制, 由於 ThreadLocalMap 的大小通常不會變化很大, 底曾是使用 Array 來實現 Map
+** resize
+實現 Map 的部份是使用 Array, 這裡我們只需要看 resize 就能知道:
+#+begin_src java
+        private void resize() {
+            Entry[] oldTab = table;
+            int oldLen = oldTab.length;
+            int newLen = oldLen * 2;
+            Entry[] newTab = new Entry[newLen];
+            int count = 0;
+
+            for (int j = 0; j < oldLen; ++j) {
+                Entry e = oldTab[j];
+                if (e != null) {
+                    ThreadLocal<?> k = e.get();
+                    if (k == null) {
+                        e.value = null; // Help the GC
+                    } else {
+                        int h = k.threadLocalHashCode & (newLen - 1);
+                        while (newTab[h] != null)
+                            h = nextIndex(h, newLen);
+                        newTab[h] = e;
+                        count++;
+                    }
+                }
+            }
+
+            setThreshold(newLen);
+            size = count;
+            table = newTab;
+        }
+#+end_src
+** set
+注意, 實際上我們是在操作一個由 Array 實現的 hash table, 所以當我們 set value 時, 就是在操作 hash table:
+1. 先取得 key 在 array 上應該有的 index i
+2. 去 array 上從 i 開始取值 e, 直到取到 e 是空則代表 value 應該被放在 tab[i] 上, 如果不為空則更新 i 和 e
+3. 在 for loop 中如果 key 相同則 replace, 然後 return
+4. 在 for loop 中取得已經失效 (null) 的 key, 則 replaceStaleEntry, 然後 return
+5. 離開 for loop 後, 清理失效的 slot, 或是擴容
+
+#+begin_src java
+        /**
+         * Set the value associated with key.
+         *
+         * @param key the thread local object
+         * @param value the value to be set
+         */
+        private void set(ThreadLocal<?> key, Object value) {
+
+            // We don't use a fast path as with get() because it is at
+            // least as common to use set() to create new entries as
+            // it is to replace existing ones, in which case, a fast
+            // path would fail more often than not.
+
+            Entry[] tab = table;
+            int len = tab.length;
+            int i = key.threadLocalHashCode & (len-1);
+
+            for (Entry e = tab[i]; e != null; e = tab[i = nextIndex(i, len)]) {
+                ThreadLocal<?> k = e.get();
+
+                if (k == key) {
+                    e.value = value;
+                    return;
+                }
+
+                if (k == null) {
+                    replaceStaleEntry(key, value, i);
+                    return;
+                }
+            }
+
+            tab[i] = new Entry(key, value);
+            int sz = ++size;
+            if (!cleanSomeSlots(i, sz) && sz >= threshold)
+                rehash();
+        }
+
+        /**
+         * Re-pack and/or re-size the table. First scan the entire
+         * table removing stale entries. If this doesn't sufficiently
+         * shrink the size of the table, double the table size.
+         */
+        private void rehash() {
+            expungeStaleEntries();
+
+            // Use lower threshold for doubling to avoid hysteresis
+            if (size >= threshold - threshold / 4)
+                resize();
+        }
+#+end_src
+** Entry
+Entry extends 了 WeakReference, 這是為了要告訴 GC: 當沒有 ThreadLocal 的對象引用 Entry 時, 該 Entry 就可以被回收了:
+#+begin_src java
+
+        /**
+         * The entries in this hash map extend WeakReference, using
+         * its main ref field as the key (which is always a
+         * ThreadLocal object).  Note that null keys (i.e. entry.get()
+         * == null) mean that the key is no longer referenced, so the
+         * entry can be expunged from table.  Such entries are referred to
+         * as "stale entries" in the code that follows.
+         */
+        static class Entry extends WeakReference<ThreadLocal<?>> {
+            /** The value associated with this ThreadLocal. */
+            Object value;
+
+            Entry(ThreadLocal<?> k, Object v) {
+                super(k);
+                value = v;
+            }
+        }
+#+end_src
+如果有任何一種強引用引用了某個對象, 則 GC 並不會對該對象進行回收, 也就是說如果 Entry 是強引用, 那麼有可能會導致 GC 無法正常回收應該被回收的對象。
+* ThreadLocal Convention
+ThreadLocal 在 Thread 中的 instance, 就是 ThreadLocalMap 的 key, 針對同個 thread 它是共享的, 因此應該以 static 修飾, 這會使得 ThreadLocal 只在第一次被導入時分配內存, 以後該線程在不同方法存取 ThreadLocal variable 的值時都是操作引用, 而不分配新的內存。 另外, 為了確保 ThreadLocal instance 的唯一性, 會以 final 修飾, 以防只在使用過程中變更:
+#+begin_src java
+private static final ThreadLocal<LocalData> LOCAL_DATA = new ThreadLocal<>();
+#+end_src
+
+然後, 當我們不再需要使用 ThreadLocal 對象時, 應該主動調用 ThreadLocal.remove():
+#+begin_src java
+public class RemoveThreadLocalDemo {
+    private static final ThreadLocal<Long> START_TIME = new ThreadLocal<>();
+    public static void main(String[] args) {
+        ExecutorService pool = new ThreadPoolExecutor(
+            2,
+            4,
+            60,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(2)) {
+            @Override
+            protected void afterExecute(Runnable r, Throwable t) {
+                super.afterExecute(r, t);
+                START_TIME.remove();
+            }
+        };
+    }
+}
+#+end_src
+
+注意, 如果我們有多個 ThreadLocal variables, 而且每個 ThreadLocal variable 有不同的失效時間, 可以分別在應該失效的地方調用該 ThreadLocal variable 的 remove, 以避免內存洩漏。
+
+總結:
+1. 使用 static final 來修飾 ThreadLocal 變量
+2. 在適當的時候 remove 掉 ThreadLocal 變量

@@ -1,0 +1,267 @@
+#+TITLE: JUC 原子類
+在多線程併發環境下, 如果需要同步的代碼塊滿足以下條件, 不建議採用 synchronized 來解決, 而是建議優先使用 JUC 原子類:
+1. 同步代碼執行時間很短
+2. 同步代碼邏輯簡單, 比如僅對基礎數據類型、Array 類型、對象引用類型做賦值操作
+
+* JUC 原子類概覽
+[[https://static001.geekbang.org/resource/image/00/4a/007a32583fbf519469462fe61805eb4a.png]]
+
+Java 將不安全的 CAS 操作封裝在 Unsafe 類中, 對外提供安全的 JUC 原子類來保證原子性, 原子類可以分為兩類:
+1. 基礎類型, 包含基礎數據類型與基礎結構類型
+2. 引用類型, 包含對象引用和對象屬性類型
+這樣的劃分方式是更合理的, 因為 Java 世界中的數據類型本質上就只有這兩類。
+** 基礎類型
+包含三類:
+ * 基礎數據類型, 包含整數、長整數、Boolean 的原子類型
+ * 數組類型, 基於基礎數據類型的數組擴展
+ * 累加器類型, 提供專門用於累加操作的類型, 它的性能比基礎的原子類型更好, 但不是透過 CAS 實現的
+** 引用類型
+對象引用類型分為兩種:
+ * 對象引用類型, 提供對對象引用的原子操作
+ * 對象屬性更新器類型, 提供透過反射對對象的屬性做原子操作
+* 基礎數據類型
+基礎數據類型和數組類型都很相似, 這裡我們只介紹 AtomicInteger, 對於 AtomicInteger, 有提供了以下方法:
+#+begin_src java
+
+// i++, i--
+getAndIncrement()
+getAndDecrement()
+
+// ++i, --i
+incrementAndGet()
+decrementAndGet()
+
+// i += delta, i -= delta
+getAndAdd(delta)
+addAndGet(delta)
+
+//CAS
+compareAndSet(expect, update)
+
+// 以下方法 update 值可傳入函數
+getAndUpdate(func)
+updateAndGet(func)
+getAndAccumulate(x, func)
+accumulateAndGet(x, func)
+#+end_src
+
+以下是同步操作僅對基礎類型操作, 使用基礎原子類的例子:
+#+begin_src java
+public class AtomicIntPlusPlusDemo {
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(10);
+        AtomicInteger a = new AtomicInteger(0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        for (int i = 0; i < 10; i++) {
+            pool.submit(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    a.getAndIncrement();
+                }
+                latch.countDown();
+            });
+        }
+        latch.await();
+        System.out.println("a:" + a.get());
+    }
+}
+// a: 10000
+#+end_src
+
+AtomicInteger 實際上是透過 volatile 保證了 value 的可見性, 讓 value 下沉到內存可見, 然後再透過 CAS 來保證原子性, 解決併發安全問題:
+#+begin_src java
+public class AtomicInteger extends Number implements java.io.Serializable {
+    private static final long serialVersionUID = 6214790243416807050L;
+
+    private volatile int value;
+
+    // setup to use Unsafe.compareAndSwapInt for updates
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long valueOffset;
+
+    static {
+        try {
+            valueOffset = unsafe.objectFieldOffset
+                (AtomicInteger.class.getDeclaredField("value"));
+        } catch (Exception ex) { throw new Error(ex); }
+    }
+
+    /**
+     * Creates a new AtomicInteger with the given initial value.
+     *
+     * @param initialValue the initial value
+     */
+    public AtomicInteger(int initialValue) {
+        value = initialValue;
+    }
+//...
+#+end_src
+
+CAS i++:
+#+begin_src java
+
+    /**
+     * Atomically updates the current value with the results of
+     * applying the given function, returning the previous value. The
+     * function should be side-effect-free, since it may be re-applied
+     * when attempted updates fail due to contention among threads.
+     *
+     * @param updateFunction a side-effect-free function
+     * @return the previous value
+     * @since 1.8
+     */
+    public final int getAndUpdate(IntUnaryOperator updateFunction) {
+        int prev, next;
+        do {
+            prev = get();
+            next = updateFunction.applyAsInt(prev);
+        } while (!compareAndSet(prev, next));
+        return prev;
+    }
+#+end_src
+* 引用類型
+** 對象引用
+基礎原子類型只能保證對一個基礎類型變量的原子性, 而當我們要保證對引用變量操作的原子性時, 就需要原子的對象引用類型和原子的變量屬性更新類型來提供對對象引用、對象屬性更新的原子性。
+這裡我們先實現一個 User 對象:
+#+begin_src java
+class User implements Serializable {
+    String uid;
+    String name;
+    public volatile int score;
+
+    public User(String uid, String name, int score) {
+        this.uid = uid;
+        this.name = name;
+        this.score = score;
+    }
+    @Override
+    public String toString() {
+        return "User{" +
+            "uid='" + uid + '\'' +
+            ", name='" + name + '\'' +
+            ", score=" + score +
+            '}';
+    }
+}
+#+end_src
+
+我們考慮一種場景如下:
+1. 可以獲得更高的 score 的 User 是 champion
+2. User 獲得分數的行為互相獨立
+這樣的場景下, 僅有改變 champion 指向的 User 的部份是同步的, 其他是異步操作, 此時可以使用以下方式實現:
+#+begin_src java
+public class CASReferenceDemo {
+    static AtomicReference<User> champion = new AtomicReference<>();
+    public static void main(String[] args) {
+        User userA = new User("1", "A", 80);
+        User userB = new User("2", "B", 100);
+        champion.set(userA);
+        System.out.println(champion.get());
+        champion.set(userB);
+        System.out.println(champion.get());
+    }
+}
+#+end_src
+** 對象屬性更新類
+如果要保證修改某個對象的屬性的行為是原子的, 需要使用對象屬性更新類:
+ * AtomicIntegerFieldUpdater
+ * AtomicLongFieldUpdater
+ * AtomicReferenceFieldUpdater
+
+要保障安全更新對象屬性有兩個步驟:
+1. 為了保證對象屬性是內存可見的, 我們要使用 volatile 修飾
+2. 透過靜態工廠方法和 reflection 機制得到 updater
+3. 透過 updater 更新指定的屬性
+#+begin_src java
+public class CASFieldUpdaterDemo {
+    static final AtomicIntegerFieldUpdater<User> userUpdater = AtomicIntegerFieldUpdater.newUpdater(User.class, "score");
+
+    public static void main(String[] args) {
+        User userA = new User("1", "A", 0);
+        System.out.println(userA);
+        userUpdater.getAndSet(userA, 100);
+        System.out.println(userA);
+    }
+}
+#+end_src
+* 使用 JUC Atomic 類解決線程安全問題
+對於某個對象的多個屬性的修改必須具有原子性時, 我們可以考慮以下作法:
+1. 將這些屬性都封裝到一個類中, 並將該類所有屬性都以 final 修飾成 immutable
+2. 讓對象以 AtomicReference 的方式 aggregate 這個對象, 並且以 private 修飾
+3. 當須修改這些屬性時, 需要透過 CAS 自旋的方式 set
+
+考慮以下情境:
+1. 有一個 Boundary 類, 有上界與下界, 要求上界必須下界
+2. 每個線程都可對上下界修改
+#+begin_src java
+public class AtomicBoundary {
+    private final AtomicReference<SafeBoundary> refBoundary = new AtomicReference<>(new SafeBoundary(Integer.MIN_VALUE, Integer.MAX_VALUE));
+
+    static class SafeBoundary {
+        final int lower;
+        final int upper;
+
+        SafeBoundary(int lower, int upper) {
+            if (lower > upper)
+                throw new IllegalArgumentException();
+            this.lower = lower;
+            this.upper = upper;
+        }
+
+        SafeBoundary(SafeBoundary boundary) {
+            this.lower = boundary.lower;
+            this.upper = boundary.upper;
+        }
+    }
+
+    public void setBoundary(int lower, int upper){
+        boolean success;
+        SafeBoundary curBoundary;
+        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
+        do {
+            curBoundary = refBoundary.get();
+            Thread.yield(); // 放大 CAS 失敗的效果
+            success = refBoundary.compareAndSet(curBoundary, newBoundary);
+            if (!success)
+                System.out.println("Thread " + Thread.currentThread().getName() + " CAS faild");
+        } while (!success);
+    }
+
+    public SafeBoundary getBoundary() {
+        return new SafeBoundary(refBoundary.get());
+    }
+}
+#+end_src
+
+setBoundary 可以精簡成:
+#+begin_src java
+    public void setBoundary(int lower, int upper){
+        boolean success;
+        SafeBoundary curBoundary;
+        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
+        do {
+            curBoundary = refBoundary.get();
+            success = refBoundary.compareAndSet(curBoundary, newBoundary);
+        } while (!success);
+    }
+#+end_src
+
+應用時:
+#+begin_src java
+public class BoundaryDemo {
+    static ExecutorService pool = Executors.newCachedThreadPool();
+    static AtomicBoundary boundary = new AtomicBoundary();
+
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(10);
+        for (int i = 0; i < 10; i++) {
+            pool.submit(() -> {
+                int lower = (int) (Math.random() * 100);
+                int upper = lower + (int) (Math.random() * 100);
+                boundary.setBoundary(lower, upper);
+            });
+            latch.countDown();
+        }
+        pool.shutdown();
+    }
+}
+#+end_src

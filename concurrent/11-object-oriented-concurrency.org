@@ -1,0 +1,104 @@
+#+TITLE: 物件導向併發程式設計
+我們在這章要引入 OOP 的思想, 讓併發程序的質量在工程化層面上有本質的飛越。 這樣的方法可以分成三類: *封裝共享變量* 、 *識別共享變量之間的約束條件* 和 *制定併發訪問策略* , 以下我們逐個探討。
+* 封裝共享變量
+封裝共享變量的意思是: *將共享變量與操作共享變量的方法封裝起來, 對外暴露線程安全的訪問方法, 並且制定合適的併發訪問策略。* 例如, 以下的實現:
+#+begin_src java
+
+public class Counter {
+  private long value;
+  synchronized long get(){
+    return value;
+  }
+  synchronized long addOne(){
+    return ++value;
+  }
+}
+#+end_src
+實際的工作場景中, 我們也應該將不會變化的屬性以 final 修飾, 比如銀行帳號, 身份證字號等。 當我們這麼做時, 相當於在告訴所有人, 我已經考慮過這些共享變量的併發安全問題了。
+* 識別共享變量之間的約束條件
+識別共享變量之間的約束條件非常重要, 因為這會決定併發訪問策略, 例如:
+#+begin_src java
+public class SafeWM {
+  private final AtomicLong upper = new AtomicLong(0);
+  private final AtomicLong lower = new AtomicLong(0);
+
+  void setUpper(long v){
+    upper.set(v);
+  }
+
+  void setLower(long v){
+    lower.set(v);
+  }
+}
+#+end_src
+這是一個設置庫存的類, 由於使用了原子類, 所以庫存水位的 get, set 是線程安全的。 但是我們忽略了, 在設置時, 低庫存水位必須低於高庫存水位這個約束條件, 於是我們改成這樣:
+#+begin_src java
+public class SafeWM {
+  private final AtomicLong upper = new AtomicLong(0);
+  private final AtomicLong lower = new AtomicLong(0);
+
+  void setUpper(long v){
+    if (v < lower.get()) {
+      throw new IllegalArgumentException();
+    }
+    upper.set(v);
+  }
+  void setLower(long v){
+    if (v > upper.get()) {
+      throw new IllegalArgumentException();
+    }
+    lower.set(v);
+  }
+}
+#+end_src
+但是這樣設計, 就破壞線程安全了, 因為存在競態條件。 比如線程 A 和線程 B 同時要修改庫存水位, 而 A 的設定的高水位比 B 設定的低水位更低, 於是就衝突了。 共享變量之接如果存在約束條件, 通常少不了判斷語句, 而判斷語句通常都會引發競態條件, 這點要格外注意。 我們可以有幾種修改思路, 第一種是對兩個方法都加 synchronized 修飾:
+#+begin_src java
+public class SafeWM {
+  private final AtomicLong upper = new AtomicLong(0);
+  private final AtomicLong lower = new AtomicLong(0);
+
+  synchronized void setUpper(long v){
+    if (v < lower.get()) {
+      throw new IllegalArgumentException();
+    }
+    upper.set(v);
+  }
+  synchronized void setLower(long v){
+    if (v > upper.get()) {
+      throw new IllegalArgumentException();
+    }
+    lower.set(v);
+  }
+}
+#+end_src
+第二種, 暴露 setBoundary(Boundary boundary), 這樣的 boundary 是在 stack frame 裡的, 是線程封閉的:
+#+begin_src java
+class Boundary {
+    private long lower;
+    private long upper;
+
+    public Boundary(long lower, long upper) {
+        if (lower >= upper) {
+            throw new IllegalArgumentException();
+        }
+
+        this.lower = lower;
+        this.upper = upper;
+    }
+}
+#+end_src
+* 制定併發訪問策略
+制定併發訪問策略是一件巨大的工程, 是我們整個併發程式設計嘗試要解決的問題, 不過從方案的分類上, 可以分為三類:
+1. 避免共享
+   也就是反覆提到的 TLS, 以及給任務分配獨立的線程。
+2. 不變模式
+   這個模式在 Java 領域使用的很少, 但是在其他領域有著廣泛的運用, 例如: Actor 模式、CSP 模式以及函數式編程都是基於不變模式。
+3. 管程以及併發工具包的同步工具
+   使用管程, 或是並發包的讀寫鎖、併發容器等更好。
+
+另外, 請遵守以下原則:
+1. 優先使用成熟的工具類
+2. 避免使用低級的同步原語
+   synchronized、Lock、Semaphore 等
+3. 避免過早優化
+   合理的開發流程是, 先保證安全性, 當出現性能瓶頸後, 針對性能瓶頸進行優化, 因為你永遠無法預估性能瓶頸。

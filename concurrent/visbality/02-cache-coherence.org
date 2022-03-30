@@ -1,0 +1,40 @@
+#+TITLE: 緩存一致性協議
+為了提高處理速度, CPU core 會將數據複製到高速緩存 (L1, L2 中) 再對其進行修改, 但是更新後的數據並不知道何時會被刷新到主內存中。 如果聲明了 volatile, JVM 會向 CPU 發送帶有 lock 的指令, 將這個變量的修改先寫回到主內存。 但是即便寫回到主內存, 如果其他 CPU core 的數據還是舊的, 依然有可見性的問題, 而緩存一致性協議就是在寫入時如何通知其他 CPU core 緩存已經失效, 並且應做何處裡的機制。
+* 兩種寫入模式
+為保證緩存一致性, 主要有兩種寫入模式:
+ * Write-Through 直寫
+   在數據更新時, 同時更新下級緩存的數據, 這樣其他 core 就都能讀到最新的數據。 這樣的模式優點是不需要緩存一致性協議支持, 只要讀取時數據都是最新的, 但缺點就是慢, 因為更新數據最終要落到主內存上。
+ * Write-Back 回寫
+   *數據更新只發生在高速緩存, 只有在數據被替換出高速緩存, 或是變成共享狀態時, 才會被更新到主內存。 這樣的模式缺點是, 必須有緩存一致性協議支持。*
+* MSI 協議
+Write-Back 回寫模式下, 先對數據進行寫入的 core, 會通知其他 core 緩存已經失效, 如果同時有多個 core 要求寫入同樣的設備, 那麼總線會將寫入操作串行化:
+1. C1, C2 的高速緩存中沒有數據 x, 從主內存中讀取 x 複本到高速緩存
+2. C1 先對 x 的值進行修改, C1 通知 C2 x 的值已經失效
+3. C2 的高速緩存中沒有 x, 從 C1 的高速緩存中讀取 x, C2 完成更新後 Write-Back 到主內存, x 被標記為共享態
+* MESI 緩存行數據的四種狀態
+MESI 協議是 MSI 協議的擴展, 是一種寫入失效協議。 MESI 分別是 *Cache Line 緩存行* 的四種狀態: Modified, Exclusive, Shred, Invalid, 可以用 2 bits 表示。 注意, MESI 狀態是緩存行數據的狀態, 因此不同 core 的高速緩存可能處在不同的狀態。
+** M Modified
+該緩存行的數據只在一個 CPU core 的緩存中有複本, 且數據是 Dirty 的。 該緩存數據要在未來某一時間點 (其他 core 訪問主內存的該行數據前), *Write-Back 回寫* 到主內存。 *Write-Back 回寫* 到主內存後, 該緩存行的狀態會變為 E Exclusive 狀態。
+** E Exclusive
+該緩存行的數據只在一個 CPU core 的緩存中有複本, 且數據是 Clean 的。 簡單來說, M 和 E 的共同點是, 所有緩存中只有唯一的複本, 區別在於該數據是否與內存中的數據一致。
+** S Shared
+該緩存行的數據在多個 CPU cores 的緩存中有複本, 且數據是 Clean 的。 一旦有任何一個 core 對數據進行修改, 緩存行數據狀態會變為 Invalid。
+** I Invalid
+該緩存行的數據在多個 CPU cores 的緩存中有複本, 且數據是 Dirty 的。
+* MESI 轉換的階段
+ * Local Read
+   讀取自己私有的 cache, 或是由於沒有任何其他緩存有數據複本而讀取主內存的數據
+ * Local Write
+   寫入自己私有的 cache
+ * Remote Read
+   向別的 core cache 讀取數據。兩個 core 之間靠 Memory Controller 通信。
+ * Remote Write
+   向別的 core cache 讀取數據, 但不只是為了讀, 還要寫, 此時要向被訪問的緩存發送 Request For Owner 請求。 其他處在 S 狀態的所有緩存行複本都要被改為 I 狀態。
+[[./image/mesi-state-machine.png]]
+[[./image/mesi-state-details.png]]
+* volatile
+volatile 修飾的共享變量可以保證主內存可見性。 在正常狀態下, 在修改變量時不會主動驗證緩存和內存數據是否一致, 但是如果使用 volatile 修飾, 則在更新時時立刻寫入到主內存。 volatile 關鍵字底曾是透過帶有 lock 前綴的指令實現的, lock 前綴指令有三個功能:
+1. 將當前 CPU 緩存行的數據立即寫回主內存
+   lock 前綴指令在運行期間 core 獨占主內存, 老的 CPU 會以 Bus Lock 阻塞, 新的 CPU 以 Cache Lock 方式實現獨占性訪問。
+2. lock 前綴指令在運行時, 其他緩存行的數據會被通知失效
+3. lock 前綴指令禁止指令重排

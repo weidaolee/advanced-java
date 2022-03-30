@@ -1,0 +1,83 @@
+#+TITLE: 線程間通信
+線程是 OS 最小的調度單位, 有自己的內存空間 (stack), 可以按照既定的代碼逐步執行。 當多個線程同時操作共享資源時, 我們需要讓線程之間存在一種通信機制以告知彼此的狀態, 以避免無效的資源爭奪或是資源閒置。
+
+線程通信的方式有很多種, 比如: Wait-Notify、共享內存、管道流。 Wait-Notify 是 Java 最普遍的線程間通信機制, 我們這裡先介紹 Wait-Notify
+* Wait-Notify
+在上一節中, 我們使用 Allocator 來一次性申請鎖, 而 Account 必須等 Allocator 分配到所有資源才可以進入臨界區, 但是我們在等待時使用了 while, 這樣 CPU 會浪費在 while 條件的判斷上, 理想的情況是: 當有線程進入臨界區時, 讓其他線程被阻塞並釋放 CPU 的佔用, 等到該線程離開臨界區時, 喚醒其他線程。
+
+在 Java 中, 我們使用 wait(), notify(), notifyAll() 來操控 Wait-Notify 機制。 在 *重量級鎖* 的章節我們有提到, 每一個 Object 都擁有自己的一個 Monitor, 而 wait(), notify(), notifyAll() 等操作, 就是面向這個 Object 的 Monitor 的操作, 所以這些都是 Object 的方法。
+** Object.wait()
+在線程進入臨界區時, 有可能因為某些原因, 自己又失去執行臨界區代碼的資格, 此時要將鎖釋放, 並且讓出 CPU, 且自己要進入等待狀態。
+
+wait() 與 Monitor 之間的工作流程:
+  1. 當線程調用了 Object.wait() 後, JVM 會將當前線程加入 WaitSet 等待隊列
+  2. 當前線程會釋放 Object 的 Owner, 讓其他線程可以競爭 Object 的 Owner
+  3. 當前線程進入 WAITING 狀態
+** Object.notify() 或 Object.notifyAll()
+ * notify
+   當有線程操作 notify() 時, 會通知 WaitSet 中的第一個線程, 被通知的線程會進入 EntryList, 並且狀態從 WAITING 切換成 BLOCKED
+ * notifyAll
+   當有線程操作 notify() 時, 會通知 WaitSet 中的所有線程, 所有線程都會進入 EntryList, 並且狀態從 WAITING 切換成 BLOCKED
+
+ 執行完上面步驟後, 當前線程會讓出 Owner, 讓 EntryList 的線程可以爭搶 Owner, 成為 Owner 的線程狀態切換成 Runnable。
+* 用 Notify-Wait 機制來 model 一個死鎖的解決方案
+無論用哪一種方式實現 Notify-Wait 機制, 都只要考慮以下 4 個問題:
+1. 互斥鎖的對象是誰
+2. 上鎖的必要條件
+3. 進入等待的條件
+4. 發出通知的條件
+延續我們的案例:
+1. 互斥鎖的對象: Allocator
+2. 上鎖滿足條件: 轉入與轉出帳戶都沒有被申請過
+3. 進入等待的條件: 當線程不滿足上鎖的必要條件
+4. 發出通知的條件: 有線程釋放帳戶
+接下來, 我們將會使用 Wait-Notify 機制的經典範式:
+#+begin_src java
+while (條件不滿足) {
+    wait();
+}
+#+end_src
+這兩行代碼, 是經典範式, 它解決一個很重要的問題, 也就是一個滿足上鎖條件的線程, 有可能因為某些原因而又不滿足上鎖條件, 必須重新檢查條件是否被滿足。 注意, 這種範式是用來遵守的. 不是用來打破的, 在後面的章節我們會再詳細討論。 接下來, 我們來實現我們的案例:
+#+begin_src java
+class Allocator {
+    private static List<Object> lockedResources = new ArrayList<>();
+    private static instance = new Allocator();
+    private Allocator();
+    public Allocator getInstance() {
+        return instance;
+    }
+
+    synchronized void apply (Object from, Object to) {
+        while (lockedResources.contains(from) || lockedResources.contains(to)) {
+            try {
+                wait();
+            } catch (Exception e) {
+                //...
+            }
+        }
+        lockedResources.add(from);
+        lockedResources.add(to);
+    }
+
+    synchronized void free(Object from, Object to) {
+        lockedResources.remove(from);
+        lockedResources.remoce(to);
+        notifyAll();
+    }
+}
+#+end_src
+* prefer notifyAll rather than notify
+notify 和 notifyAll 的區別在 notify 只會隨機通知 1 個線程, 而 notifyAll 會通知所有線程。 感覺 notify 更好一些, 因為只有一個線程會進行競爭, 但這有可能導致有些線程永遠不被通知道。
+我們考慮以下案例, 假設我們有 4 個帳戶, A1-A4, 和 4 個線程 T1-T4:
+1. T1 申請 A1、A2, 上鎖成功
+2. T2 申請 A3、A4, 上鎖成功
+3. T3 申請 A1、A2, 進入等待
+4. T4 申請 A3、A4, 進入等待
+5. T1 釋放 A1、A2, 歸還資源
+此時如果使用 notify, 有可能通知的是 T4, 但是 T4 需要的資源並沒有被釋放, 因此 T4 會進入等待, T2 如果釋放了 A3、A4, 它會通知 T3 或 T4, 那麼至少有一個在等待的線程會永遠處在等待的狀態。
+* wait 和 sleep
+這兩個方法經常被對比, 首先注意, 兩個方法都不會佔用 CPU 資源
+ * wait()
+   wait() 方法是屬於 Object 類的方法, 它操作的對象是等待隊列。 調用 wait 後會釋放鎖, 是 Wait-Notify 不可少的機制, 並且它只在臨界區可以被調用。
+ * sleep()
+   sleep() 方法是屬於 Thread 類的方法, 它操作的對象是線程本身。 調用 sleep 必須指定時間, 調用它也不會釋放鎖. 但是合理地使用它可以讓出競爭鎖的機會, 並且它可以在任意地方被調用。

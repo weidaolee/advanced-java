@@ -1,0 +1,62 @@
+#+TITLE: Java Object Header 結構與鎖的狀態
+本章我們將討論 Java 的 Object 結構。 透過理解對象結構, 我們能理解 JVM 管理鎖的具體行為。以下為 Java Object 結構:
+
+[[./image/object-structure.png]]
+* 對象實例的三個基本結構
+每一個對象實例, 都包含三個基本結構: 對象頭, 對象體, 以及對齊字節。
+** Header 對象頭
+對象頭包含三個部份:
+ * Mark Word
+   用於儲存運行時的數據, 包含 GC 標誌位, Hash 值, 鎖的狀態。
+ * Class pointer
+   用於儲存方法區 Class 對象的地址。
+ * Array Length
+   如果這個字段是一個 array (連續存儲), 那麼必須有這個字段, 它表示 array 的長度。
+*** 對象體
+包含實例對象的 attributes, 按 4 byte 對齊
+*** 對齊字節
+保證 Java 對象佔用的字節數必須是 8 的整數倍 (1 byte = 8 bits), 對象頭本身也是要要 8 的整數倍, 不足的部份由此字段填充。
+** 對象結構中的字段長度與指針壓縮
+如果 JVM 的對象眾多, 使用 64 位的指針會造成 50% 的內存佔用, 為了節約內存可以以 -XX:+UseCompressedOops 來開啟指針壓縮, Oops 的意思是 ordinary object pointer, 開啟此選項後, 以下指針將被壓縮:
+ * Class 對象的 attributes 指針 (靜態指針)
+ * Object 對象的 attributes 指針 (成員變量)
+ * 普通對象數組的元素指針
+* Mark Word 結構
+Mark Word 結構是在對象頭中, JVM 是透過對象頭的 Mark Word 的鎖訊息來控制鎖的狀態。 以下是 32 位與 64 位的 JVM 的內存空間結構:
+32 位的 Mark Word 結構:
+[[./image/mark-word-32-bits.png]]
+64 位的 Mark Word 結構:
+[[./image/mark-word-64-bits.png]]
+目前主流的都是 64 位的 JVM, 接下來我們針對 64 位的 JVM 來解釋:
+ * age: 4 bits
+   代表分代年齡。 在 GC 過程中, 對象在 Survivor 區被複製一次, age 就 +1, 當 age 達到閾值時, 對象將晉升至老年代。 Parallel GC 默認為 15 次, CMS GC 默認為 6 次, 由於 age 為 4 bits, 所以晉升閾值最大為 15。 透過 -XX:MaxTenuringThreshold 設置。
+ * identity_hashcode: 31 bits
+   Hash code, 採用 lazy load 技術。 當調用 Object.hashCode() 或 System.identityHashCode() 計算 Hash value 時, 計算結果才會被紀錄到 header 中。 當 Object 被上鎖時, 該值會移入 Monitor 中。
+ * lock 和 biased_lock: 2 bits, 1 bit
+   兩者組合成鎖狀態的資訊。 當 lock 是 01 時, 如果 biased_lock 是 0, 代表此 object 是無鎖的; 當 lock 是 01 時, 如果 biased_lock 是偏向鎖。 也就是說, 偏向鎖僅僅是無鎖狀態的一種特例。
+ * epoch: 2 bits
+   epoch 佔 2 位, 是偏向時間戳。
+ * thread: 54 bits
+   表示持有偏向鎖的線程 id
+ * ptr_to_lock_record: 62 bits
+   在輕量級鎖的狀態下, 指向 stack frame 中鎖紀錄的指針
+ * ptr_to_heavyweight_monitor: 62 bits
+   在重量級鎖的狀態下, 指向 monitor 的指針
+* 四種鎖的狀態與鎖膨脹機制
+在 *JDK 1.6 以前, 所有的隱式鎖都是重量級鎖, 這會造成 CPU 在用戶態與內核態頻繁切換, 代價很高且性能低下。* 在 1.6 以後為了提昇併發性, 隱式鎖採用顆粒度更小的鎖, 並且隨併發競爭的強度自動膨脹鎖的顆粒度。 鎖的狀態依照鎖的顆粒度可分為: 無鎖, 偏向鎖, 輕量級鎖, 以及重量級鎖。 鎖可以變大, 但不能變小, 這種單調遞增的策略是為了提高獲得鎖與釋放鎖的效率。 鎖的狀態轉換, 是透過改變 Object header 中 Mark Word 的狀態控制的, 我們可以說, 隱式鎖的狀態就等於 Mark Word 的狀態。
+** No Lock 無鎖狀態
+Object 創建時由於沒有線程來競爭, 是處在無鎖的狀態。 此時 biased_lock = 0, lock = 01
+[[./image/mark-word-no-lock.png]]
+** Biased Lock 偏向鎖
+當一個臨界區暫時只被一個線程訪問時, 那麼該線程會自動 *隱式的* 獲取鎖, 降低獲取鎖的代價, 這種鎖狀態就是偏向鎖。 它表示的是隱式鎖機制目前偏愛、偏向這個線程, 當這個線程要執行臨界區的代碼時, 不須再做任何檢查或切換 。 偏向鎖的 Mark Word 會紀錄偏向的線程 id, 當是偏向的線程來訪問時, 不做任何檢查, 因此在競爭不激烈的情況下, 偏向鎖的效率非常高。 lock = 1, 和無鎖狀態的值相同, 而透過 biased_lock = 1 知道這是偏向鎖, 並透過 thread 知道偏向的線程 id。
+[[./image/mark-word-biased-lock.png]]
+** Lightweight Lock 輕量級鎖
+當有兩個線程來競爭 Object 鎖時, 偏向鎖就會被升級為輕量級鎖。 兩個線程會公平競爭, 哪個線程先成功佔用了 Object, Object 的 Mark Word 中的 ptr_to_lock_record 就會指向這個鎖是屬於哪個 stack frame 的 lock record, 此時 lock = 00 。
+[[./image/mark-word-lightweight-lock.png]]
+
+搶佔失敗的鎖會嘗試自旋 (盤旋) 的方式獲得鎖, 自旋過程並不會阻塞線程, 以便提高性能。 自旋的目的很簡單, 如果佔用鎖的線程能很快釋放掉鎖, 那處在自旋的線程能立刻獲得鎖, 過程中不觸發用戶態/內核態的切換, 避免不必要的消耗。
+
+但是, 自旋是佔用 CPU 的, 所以自旋必須設定閾值, 否則 CPU 都處在空轉。 JDK 1.6 使用的是自適應自旋鎖, 如果以自旋的方式獲得鎖成功, 下次的閾值就會提高, 否則閾值會降低。 如果自旋次數消耗完 (達到閾值), 線程會進入阻塞狀態, 該鎖會膨脹成重量級鎖。
+** Heavyweight Lock 重量級鎖
+又稱為同步鎖, 互斥鎖。 重量級鎖會讓其他線程進入阻塞狀態, Mark Word 中 ptr_to_heavyweight_monitor 會指向控制對象同步的 Monitor 對象, 該 Monitor 會依照 MSEA 模型來管理並同步線程。
+[[./image/mark-word-heavyweight-lock.png]]
