@@ -12,11 +12,11 @@
    用於儲存方法區 Class 對象的地址。
  * Array Length
    如果這個字段是一個 array (連續存儲), 那麼必須有這個字段, 它表示 array 的長度。
-*** 對象體
+** 對象體
 包含實例對象的 attributes, 按 4 byte 對齊
-*** 對齊字節
+** 對齊字節
 保證 Java 對象佔用的字節數必須是 8 的整數倍 (1 byte = 8 bits), 對象頭本身也是要要 8 的整數倍, 不足的部份由此字段填充。
-** 對象結構中的字段長度與指針壓縮
+* 對象結構中的字段長度與指針壓縮
 如果 JVM 的對象眾多, 使用 64 位的指針會造成 50% 的內存佔用, 為了節約內存可以以 -XX:+UseCompressedOops 來開啟指針壓縮, Oops 的意思是 ordinary object pointer, 開啟此選項後, 以下指針將被壓縮:
  * Class 對象的 attributes 指針 (靜態指針)
  * Object 對象的 attributes 指針 (成員變量)

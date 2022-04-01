@@ -1,0 +1,110 @@
+#+TITLE: 重排序與內存屏障
+* 重排序
+重排序有兩個階段, 編譯器重排與 CPU 重排:
+[[./image/instruction-reordering-stage.png]]
+** 編譯器重排序
+在代碼中, 如果 A 操作要獲取其他資源而進入等待狀態, 而 A 之後的操作又不依賴於 A 的執行結果, 則 compiler 會先編譯後面的代碼, 這樣可以提昇 compile 的效率. 與 CPU 亂序執行相比, CPU 重排序可以完成更大範圍、效果更好的亂序優化。
+** CPU 重排序
+*Pipeline* 和 *Out-of-Order Execution 亂序執行* 是現代 CPU 基本必備的特性。 機器指令會在 pipeline 中經歷取指令、解碼、執行、寫回等操作, 為了 CPU 執行效率, pipeline 都是並行處理的, process order 和 program order 是允許不一樣的, 只要滿足 As-if-Serial 即可。 而且, CPU 的亂序也是有前提的: 兩個指令之間不能存在數據依賴。
+ * 指令級別重排序
+   不影響結果的前提下, CPU core 採用 *Instruction-Level Parallelism 指令級並行運算* 將多條指令平行處裡。 如果指令之間不存在數據依賴關係, CPU 可以對指令進行重排, 以獲得更好的並行度。
+ * 內存系統重排
+   CPU 會請向將修改優先寫入高速緩存, 在有必要時才將結果一次性更新到主內存中。 內存系統的重排序, 並沒有真正做重排序的動作, 而是由於優先寫入高速緩存, 導致執行過程中看起來像是亂序的樣子。
+* As-if-Serial
+compiler 重排序和 CPU 重排序都要至少滿足 As-if-Serial 原則: 無論如何重排, 至少先要滿足單核 CPU 執行結果是正確的。
+以下是極簡釋例, 1, 2 可交換, 3 不可交換。
+#+begin_src java
+public class ReorderDemo {
+    public static void main(String[] args) {
+        int a = 1;      // 1
+        int b = 2;      // 2
+        int c = a + b;  // 3
+    }
+}
+#+end_src
+
+Java 為了保證 As-if-Serial 原則, 對 try-catch 也做了一些特殊處理:
+#+begin_src java
+public class TryCatchReorderDemo {
+    public static void main(String[] args) {
+        int x, y;
+        int x = 0;
+        try {
+            x = 1;
+            y = 0 / 0;
+        } catch (Exception e) {
+            //...
+        } finally {
+            System.out.println("x: " + x);
+        }
+    }
+}
+#+end_src
+上面的 x = 1; 與 y = 0 / 0; 互相沒有依賴所以可以交換, 如果 y = 0 / 0; 先執行然後觸發異常會導致 x = 1; 沒被執行, 而導致結果是錯誤的。
+
+所以為了保證最終輸出的結果正確, *Just-in-Time JIT* 會在重排指令時在 catch 插入錯誤補償代碼, 以保證異常捕獲時將其他數據恢復到捕獲異常時應有的狀態。 這種作法的代價是 try-catch 的實現會相當複雜, 但 JIT 的優化則是: 盡力保證 catch block 的正確邏輯, 那怕是以使其變得複雜為代價。
+
+但是 As-if-Serial 原則只是最低標準, 只能保證單核 CPU 在編譯器重排或是 CPU 重排後是正確的, 不保證多核下也是正確的。
+* 硬件層面的內存屏障
+硬件層面的內存屏障是讓一個 CPU core 的高速緩存的狀態對其他 CPU core 是可見的技術, 也是保障跨 CPU core 能有序執行的技術。 多核情況下 CPU 必須遵守 MESI 協議工作, 但是 MESI 僅保證存的可見性, 沒有限制 CPU 跨指令的有序執行。 要保證多 CPU 下的重排序具備有序性, 需要有內存屏障技術, 有主要兩個功能:
+1. 限制重排序的範圍
+2. 讓高速緩存失效, 強制 CPU 重新加載數據, 或是強制 CPU 將高速緩存的數據寫入主內存
+內存屏障可以分為三種: *Load Barrier 讀屏障*, *Store Barrier 寫屏障*, *Full Barrier 全屏障*
+** Load Barrier 讀屏障
+在指令前插入 load barrier 可以使高速緩存中的數據失效, 以強制 CPU 重新加載數據, 並且規範 compiler 和 CPU: 在 load barrier 之前的指令必須先執行, 限制了重排序的範圍。 load barrier 對應 X86 的 lfence, 在指令 lfence 後的加載操作, 都在 lfence 之後被執行, 且在執行 lfence 後高速緩存的內容會全部失效, 以便強制 CPU core 從主內存中加載數據, 已保證可見性。
+** Store Barrier 寫屏障
+在指令後插入 store barrire 可以使高速緩存的數據被更新到主內存, 使更新後的結果對其他 CPU core 可見, 並且規範 compiler 和 CPU: 在 store barrier 之後的指令必須後執行, 限制重排序的範圍。 store barrier 對應 X86 的 sfence, 在指令 sfence 前的寫入操作, 都在 sfence 之前被執行, 且執行 sfence 後會同步到主內存中, 使得更新的結果對所有 CPU core 可見。
+** Full Barrier 全屏障
+同時具備 load barrier 和 store barrier 的特性: 強制在 full barrier 之前/後的指令都在 full barrier 之前/後被執行, 也就是說, 指令不可以跨 full barrier 重排序。 full barrier 對應 X86 的 mfence, 但 lock 前綴指令也有 fulll barrier 的效果
+* 重排導致的有序性問題
+試分析以下結果:
+#+begin_src java
+public class NoMemoryBarrierDemo {
+    private int x = 0;
+    private boolean isModified = false;
+
+    public void update() {
+        x = 1;
+        isModified = true;
+    }
+    public void show() {
+        if(isModified) {
+            System.out.println("x: " + x);
+        }
+    }
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newCachedThreadPool();
+        NoMemoryBarrierDemo demo = new NoMemoryBarrierDemo();
+        pool.submit(demo::update);
+        pool.submit(demo::show);
+        pool.shutdown();
+    }
+}
+#+end_src
+
+show 只在 isModified = true 時, 也就是 x 有被修改時才會被 print, 而且 print 的結果應該要為 1, 但是實際併發執行的結果並不是這樣: isModified = true 的情況下, x 有可能是 0。
+會有這樣的結果是因為: update 和 show 可能是在兩個 CPU core 併發執行, 如果此時 x = 1; 和 isModified = true; 發生指令重排, 就會導致這種狀況。 以下代碼是重排後的示意效果:
+#+begin_src java
+public class NoMemoryBarrierDemo {
+    private int x = 0;
+    private boolean isModified = false;
+
+    public void update() {
+        isModified = true;
+        sleep(500);
+        x = 1;
+    }
+    public void show() {
+        if(isModified) {
+            System.out.println("x: " + x);
+        }
+    }
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newCachedThreadPool();
+        NoMemoryBarrierDemo demo = new NoMemoryBarrierDemo();
+        pool.submit(demo::update);
+        pool.submit(demo::show);
+        pool.shutdown();
+    }
+}
+#+end_src

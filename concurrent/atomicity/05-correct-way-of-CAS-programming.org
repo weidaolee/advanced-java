@@ -1,0 +1,89 @@
+#+TITLE: CAS Programming 的正確方式
+* ABA 問題
+在 ABA 的章節我們討論了即便 CAS 操作成功, 可能也有隱含 ABA 問題, JDK 為此提供了 AtomicStampedReference 和 AtomicMarkableReference 兩個類來解決, 前者是增加版本號的比對, 後者是透過 mark flag 做是否修改的判斷, 在實際開發中中推薦使用 AtomicStampedReference。
+* CAS 只能保證一個共享變量的原子操作
+對一個變量的修改, 可以使用 do...while 的方式做 CAS 自旋來保證原子性, 而對於某個對象的多個屬性的修改必須具有原子性時, 我們可以考慮以下作法:
+1. 將這些屬性都封裝到一個類中, 並將該類所有屬性都以 final 修飾成 immutable
+2. 讓對象以 AtomicReference 的方式 aggregate 這個對象, 並且以 private 修飾
+3. 當須修改這些屬性時, 需要透過 CAS 自旋的方式 set
+
+考慮以下情境:
+1. 有一個 Boundary 類, 有上界與下界, 要求上界必須下界
+2. 每個線程都可對上下界修改
+#+begin_src java
+public class AtomicBoundary {
+    private final AtomicReference<SafeBoundary> refBoundary = new AtomicReference<>(new SafeBoundary(Integer.MIN_VALUE, Integer.MAX_VALUE));
+
+    static class SafeBoundary {
+        final int lower;
+        final int upper;
+
+        SafeBoundary(int lower, int upper) {
+            if (lower > upper)
+                throw new IllegalArgumentException();
+            this.lower = lower;
+            this.upper = upper;
+        }
+
+        SafeBoundary(SafeBoundary boundary) {
+            this.lower = boundary.lower;
+            this.upper = boundary.upper;
+        }
+    }
+
+    public void setBoundary(int lower, int upper){
+        boolean success;
+        SafeBoundary curBoundary;
+        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
+        do {
+            curBoundary = refBoundary.get();
+            Thread.yield(); // 放大 CAS 失敗的效果
+            success = refBoundary.compareAndSet(curBoundary, newBoundary);
+            if (!success)
+                System.out.println("Thread " + Thread.currentThread().getName() + " CAS faild");
+        } while (!success);
+    }
+
+    public SafeBoundary getBoundary() {
+        return new SafeBoundary(refBoundary.get());
+    }
+}
+#+end_src
+
+setBoundary 可以精簡成:
+#+begin_src java
+    public void setBoundary(int lower, int upper){
+        boolean success;
+        SafeBoundary curBoundary;
+        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
+        do {
+            curBoundary = refBoundary.get();
+            success = refBoundary.compareAndSet(curBoundary, newBoundary);
+        } while (!success);
+    }
+#+end_src
+
+應用時:
+#+begin_src java
+public class BoundaryDemo {
+    static ExecutorService pool = Executors.newCachedThreadPool();
+    static AtomicBoundary boundary = new AtomicBoundary();
+
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(10);
+        for (int i = 0; i < 10; i++) {
+            pool.submit(() -> {
+                int lower = (int) (Math.random() * 100);
+                int upper = lower + (int) (Math.random() * 100);
+                boundary.setBoundary(lower, upper);
+            });
+            latch.countDown();
+        }
+        pool.shutdown();
+    }
+}
+#+end_src
+* 開銷問題
+惡性 CAS 空自旋問題, 有以下方案:
+1. 使用 Adder 或 Accumulator 做熱點分離, 降低 CAS 競爭顆粒度
+2. 使用隊列削蜂, CAS 競爭的線程必須排隊, 以降低 CAS 競爭粒度, 經典的 AQS 就是這麼做的

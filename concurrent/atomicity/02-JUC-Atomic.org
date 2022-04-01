@@ -14,7 +14,7 @@ Java 將不安全的 CAS 操作封裝在 Unsafe 類中, 對外提供安全的 JU
 包含三類:
  * 基礎數據類型, 包含整數、長整數、Boolean 的原子類型
  * 數組類型, 基於基礎數據類型的數組擴展
- * 累加器類型, 提供專門用於累加操作的類型, 它的性能比基礎的原子類型更好, 但不是透過 CAS 實現的
+ * 累加器類型, 提供專門用於累加操作的類型, 透過 CAS 分段鎖實現熱點分離, 大併發場景下性能優於 Atomic 類型
 ** 引用類型
 對象引用類型分為兩種:
  * 對象引用類型, 提供對對象引用的原子操作
@@ -183,85 +183,290 @@ public class CASFieldUpdaterDemo {
     }
 }
 #+end_src
-* 使用 JUC Atomic 類解決線程安全問題
-對於某個對象的多個屬性的修改必須具有原子性時, 我們可以考慮以下作法:
-1. 將這些屬性都封裝到一個類中, 並將該類所有屬性都以 final 修飾成 immutable
-2. 讓對象以 AtomicReference 的方式 aggregate 這個對象, 並且以 private 修飾
-3. 當須修改這些屬性時, 需要透過 CAS 自旋的方式 set
 
-考慮以下情境:
-1. 有一個 Boundary 類, 有上界與下界, 要求上界必須下界
-2. 每個線程都可對上下界修改
+* Atomic 類的實現思路
+理解 Java 的 CAS 底層原理後, 我們回看 JUC 裡提供的類
+** 基礎類型
+基礎類型的實現思路:
+1. composite 一個 Unsafe Object, 用於調用所有 CAS 相關的方法
+2. Atomic 基礎類型內部有一個 value 變量, 於儲存 CAS 實際操作的對象
+3. 實際 CAS 操作是使用 Unsafe 提供的 *對屬性修改* 的 CAS 方法: 傳入 this 和 value offset 來修改 value 的值
+*** Unsafe Object 和 valueOffset
+三種類型 composite 的 Unsafe Object 和 valueOffset 都相同, 並且透過 unsafe.objectFieldOffset 獲取 valueOffset:
 #+begin_src java
-public class AtomicBoundary {
-    private final AtomicReference<SafeBoundary> refBoundary = new AtomicReference<>(new SafeBoundary(Integer.MIN_VALUE, Integer.MAX_VALUE));
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long valueOffset;
 
-    static class SafeBoundary {
-        final int lower;
-        final int upper;
+    static {
+        try {
+            valueOffset = unsafe.objectFieldOffset
+                (AtomicInteger.class.getDeclaredField("value"));
+        } catch (Exception ex) { throw new Error(ex); }
+    }
+#+end_src
+*** value 和 CAS
+另外, 併發問題除了原子性外, 還有可見性問題, 而在使用 JUC 的 Atomic 類時, 可見性問題是透過 volatile 修飾 value 保證的, 這點要格外注意。
 
-        SafeBoundary(int lower, int upper) {
-            if (lower > upper)
-                throw new IllegalArgumentException();
-            this.lower = lower;
-            this.upper = upper;
-        }
+AtomicInteger :
+#+begin_src java
+    private volatile int value;
 
-        SafeBoundary(SafeBoundary boundary) {
-            this.lower = boundary.lower;
-            this.upper = boundary.upper;
-        }
+    public final boolean compareAndSet(int expect, int update) {
+        return unsafe.compareAndSwapInt(this, valueOffset, expect, update);
     }
 
-    public void setBoundary(int lower, int upper){
-        boolean success;
-        SafeBoundary curBoundary;
-        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
-        do {
-            curBoundary = refBoundary.get();
-            Thread.yield(); // 放大 CAS 失敗的效果
-            success = refBoundary.compareAndSet(curBoundary, newBoundary);
-            if (!success)
-                System.out.println("Thread " + Thread.currentThread().getName() + " CAS faild");
-        } while (!success);
-    }
-
-    public SafeBoundary getBoundary() {
-        return new SafeBoundary(refBoundary.get());
-    }
-}
 #+end_src
 
-setBoundary 可以精簡成:
+AtomicLong 的 value:
 #+begin_src java
-    public void setBoundary(int lower, int upper){
-        boolean success;
-        SafeBoundary curBoundary;
-        SafeBoundary newBoundary = new SafeBoundary(lower, upper);
-        do {
-            curBoundary = refBoundary.get();
-            success = refBoundary.compareAndSet(curBoundary, newBoundary);
-        } while (!success);
+    private volatile long value;
+    public final boolean compareAndSet(long expect, long update) {
+        return unsafe.compareAndSwapLong(this, valueOffset, expect, update);
     }
 #+end_src
 
-應用時:
+AtomicBoolean 的 value, 可以發現, AtomicBoolean 底層是 AtomicInteger, 只是規定了 value 值只能是 0 或 1:
 #+begin_src java
-public class BoundaryDemo {
-    static ExecutorService pool = Executors.newCachedThreadPool();
-    static AtomicBoundary boundary = new AtomicBoundary();
+    private volatile int value;
 
-    public static void main(String[] args) {
-        CountDownLatch latch = new CountDownLatch(10);
-        for (int i = 0; i < 10; i++) {
-            pool.submit(() -> {
-                int lower = (int) (Math.random() * 100);
-                int upper = lower + (int) (Math.random() * 100);
-                boundary.setBoundary(lower, upper);
-            });
-            latch.countDown();
-        }
-        pool.shutdown();
+    public final boolean compareAndSet(boolean expect, boolean update) {
+        int e = expect ? 1 : 0;
+        int u = update ? 1 : 0;
+        return unsafe.compareAndSwapInt(this, valueOffset, e, u);
     }
-}
+#+end_src
+
+** 數組類型
+數組類型:
+1. composite 一個 Unsafe Object, 用於調用所有 CAS 相關的方法
+2. Atomic 數組類型都有一個 array, 用於儲存 CAS 實際操作的對象
+3. 實際 CAS 操作時, 是使用 Unsafe 提供的 *對屬性修改* 的方法: 傳入 array 以及 index, 透過 index 和類型計算出要 CAS 對象的具體位址, 然後做 CAS 操作
+
+*** 計算 offset
+用於計算 offset 相關的變量有:
+ * array.class: 有 int[], long[], 和 Object[]
+ * base: array.class 的 offset
+ * i: 要操作的對象
+
+AtomicIntegerArray:
+#+begin_src java
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final int base = unsafe.arrayBaseOffset(int[].class);
+    private static final int shift;
+    private final int[] array;
+
+    static {
+        int scale = unsafe.arrayIndexScale(int[].class);
+        if ((scale & (scale - 1)) != 0)
+            throw new Error("data type scale not a power of two");
+        shift = 31 - Integer.numberOfLeadingZeros(scale);
+    }
+
+    private long checkedByteOffset(int i) {
+        if (i < 0 || i >= array.length)
+            throw new IndexOutOfBoundsException("index " + i);
+
+        return byteOffset(i);
+    }
+
+    private static long byteOffset(int i) {
+        return ((long) i << shift) + base;
+    }
+
+#+end_src
+
+AtomicLongArray:
+#+begin_src java
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final int base = unsafe.arrayBaseOffset(long[].class);
+    private static final int shift;
+    private final long[] array;
+
+    static {
+        int scale = unsafe.arrayIndexScale(long[].class);
+        if ((scale & (scale - 1)) != 0)
+            throw new Error("data type scale not a power of two");
+        shift = 31 - Integer.numberOfLeadingZeros(scale);
+    }
+
+    private long checkedByteOffset(int i) {
+        if (i < 0 || i >= array.length)
+            throw new IndexOutOfBoundsException("index " + i);
+
+        return byteOffset(i);
+    }
+
+    private static long byteOffset(int i) {
+        return ((long) i << shift) + base;
+    }
+#+end_src
+
+AtomicReferenceArray:
+#+begin_src java
+    private static final Unsafe unsafe;
+    private static final int base;
+    private static final int shift;
+    private static final long arrayFieldOffset;
+    private final Object[] array; // must have exact type Object[]
+
+    static {
+        try {
+            unsafe = Unsafe.getUnsafe();
+            arrayFieldOffset = unsafe.objectFieldOffset
+                (AtomicReferenceArray.class.getDeclaredField("array"));
+            base = unsafe.arrayBaseOffset(Object[].class);
+            int scale = unsafe.arrayIndexScale(Object[].class);
+            if ((scale & (scale - 1)) != 0)
+                throw new Error("data type scale not a power of two");
+            shift = 31 - Integer.numberOfLeadingZeros(scale);
+        } catch (Exception e) {
+            throw new Error(e);
+        }
+    }
+
+    private long checkedByteOffset(int i) {
+        if (i < 0 || i >= array.length)
+            throw new IndexOutOfBoundsException("index " + i);
+
+        return byteOffset(i);
+    }
+
+    private static long byteOffset(int i) {
+        return ((long) i << shift) + base;
+    }
+#+end_src
+
+我們可以看到, 這三種數組類型只有 offset 的具體值不同, 而這取決於 Array 是哪一種類型的數組。
+*** array 和 CAS
+三種數組類型的 CAS 完全相同, 只有 expect 和 update 類型不同, 都是透過 checkedByteOffset(i) 計算出 offset 並傳給底層的 CAS 調用:
+#+begin_src java
+    public final boolean compareAndSet(int i, int expect, int update) {
+        return compareAndSetRaw(checkedByteOffset(i), expect, update);
+    }
+
+    private boolean compareAndSetRaw(long offset, int expect, int update) {
+        return unsafe.compareAndSwapInt(array, offset, expect, update);
+    }
+#+end_src
+
+#+begin_src java
+    public final boolean compareAndSet(int i, long expect, long update) {
+        return compareAndSetRaw(checkedByteOffset(i), expect, update);
+    }
+
+    private boolean compareAndSetRaw(long offset, long expect, long update) {
+        return unsafe.compareAndSwapLong(array, offset, expect, update);
+    }
+
+#+end_src
+
+#+begin_src java
+    public final boolean compareAndSet(int i, E expect, E update) {
+        return compareAndSetRaw(checkedByteOffset(i), expect, update);
+    }
+
+    private boolean compareAndSetRaw(long offset, E expect, E update) {
+        return unsafe.compareAndSwapObject(array, offset, expect, update);
+    }
+
+#+end_src
+** 引用類型
+引用類型的結構與基礎類型相似, 只是 value 變成范型的 pointer:
+#+begin_src java
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long valueOffset;
+
+    static {
+        try {
+            valueOffset = unsafe.objectFieldOffset
+                (AtomicReference.class.getDeclaredField("value"));
+        } catch (Exception ex) { throw new Error(ex); }
+    }
+
+    private volatile V value;
+#+end_src
+
+CAS:
+#+begin_src java
+    public final boolean compareAndSet(V expect, V update) {
+        return unsafe.compareAndSwapObject(this, valueOffset, expect, update);
+    }
+#+end_src
+
+** 屬性的更新器
+只是要以 newUpdater 透過 reflection 獲得要修改對象的 pointer 和要修改的屬性的 offset:
+#+begin_src java
+    @CallerSensitive
+    public static <U,W> AtomicReferenceFieldUpdater<U,W> newUpdater(Class<U> tclass,
+                                                                    Class<W> vclass,
+                                                                    String fieldName) {
+        return new AtomicReferenceFieldUpdaterImpl<U,W>
+            (tclass, vclass, fieldName, Reflection.getCallerClass());
+    }
+#+end_src
+
+注意最後的 offset 是透過 Unsafe 提供的用於計算 attribute 的 offset 方法得到的:
+#+begin_src java
+        AtomicReferenceFieldUpdaterImpl(final Class<T> tclass,
+                                        final Class<V> vclass,
+                                        final String fieldName,
+                                        final Class<?> caller) {
+            final Field field;
+            final Class<?> fieldClass;
+            final int modifiers;
+            try {
+                field = AccessController.doPrivileged(
+                    new PrivilegedExceptionAction<Field>() {
+                        public Field run() throws NoSuchFieldException {
+                            return tclass.getDeclaredField(fieldName);
+                        }
+                    });
+                modifiers = field.getModifiers();
+                sun.reflect.misc.ReflectUtil.ensureMemberAccess(
+                    caller, tclass, null, modifiers);
+                ClassLoader cl = tclass.getClassLoader();
+                ClassLoader ccl = caller.getClassLoader();
+                if ((ccl != null) && (ccl != cl) &&
+                    ((cl == null) || !isAncestor(cl, ccl))) {
+                    sun.reflect.misc.ReflectUtil.checkPackageAccess(tclass);
+                }
+                fieldClass = field.getType();
+            } catch (PrivilegedActionException pae) {
+                throw new RuntimeException(pae.getException());
+            } catch (Exception ex) {
+                throw new RuntimeException(ex);
+            }
+
+            if (vclass != fieldClass)
+                throw new ClassCastException();
+            if (vclass.isPrimitive())
+                throw new IllegalArgumentException("Must be reference type");
+
+            if (!Modifier.isVolatile(modifiers))
+                throw new IllegalArgumentException("Must be volatile type");
+
+            // Access to protected field members is restricted to receivers only
+            // of the accessing class, or one of its subclasses, and the
+            // accessing class must in turn be a subclass (or package sibling)
+            // of the protected member's defining class.
+            // If the updater refers to a protected field of a declaring class
+            // outside the current package, the receiver argument will be
+            // narrowed to the type of the accessing class.
+            this.cclass = (Modifier.isProtected(modifiers) &&
+                           tclass.isAssignableFrom(caller) &&
+                           !isSamePackage(tclass, caller))
+                          ? caller : tclass;
+            this.tclass = tclass;
+            this.vclass = vclass;
+            this.offset = U.objectFieldOffset(field);
+        }
+#+end_src
+
+#+begin_src java
+        public final boolean weakCompareAndSet(T obj, V expect, V update) {
+            // same implementation as strong form for now
+            accessCheck(obj);
+            valueCheck(update);
+            return U.compareAndSwapObject(obj, offset, expect, update);
+        }
 #+end_src

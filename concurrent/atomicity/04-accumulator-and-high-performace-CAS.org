@@ -1,0 +1,263 @@
+#+TITLE: 提昇高併發場景下 CAS 的性能
+在激烈競爭的高併發場景下使用 CAS 可能會導致空自旋, 比如在大量線程同時併發修改一個 AtomicInteger 時, 可能有很多線程會不停自旋, 甚至有些線程會進入一個無限循環中, 從而大量佔用 CPU 資源。 另外, 大量 CAS 也可能引發 Bus 風暴, 我們會在後面的章節討論到。
+* 以空間換時間: Adder, Accumulator
+JDK 1.8 以後提供了 *Adder* 和 *Accumulator* 原子類, 包含 LongAdder, DoubleAdder, LongAccumulator, DoubleAccumulator 等, *Adder* 和 *Accumulator* 兩者的區別在於 *Accumulator* 可以接收一個函數。 *Adder* 和 *Accumulator* 的原理是熱點分離, 與 ConcurrentHashMap 的思想類似: 將 value 值分離成一個 Array, 當多線程訪問時, 透過 Hashing 將線程映射到 Array 的一個元素進行操作, 而最終需要獲取加總的 value 時, 則將整個 Array 的元素求和。
+
+以下是 LongAdder 的示意圖, 將寫入操作分散到多個 Array 的元素, 以減少競爭的顆粒度。
+[[./image/adder-visualization.png]]
+
+以下, 我們對比 AtomicLong 和 LongAdder 兩種方式:
+#+begin_src java
+class TestAtomicLongPerformance {
+    public static void test() {
+        final int TURNS = 100000000;
+        final int TASKS = 10;
+
+        ExecutorService pool = Executors.newCachedThreadPool();
+        AtomicLong x = new AtomicLong(0);
+        CountDownLatch latch = new CountDownLatch(TASKS);
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < TASKS; i++) {
+            pool.submit(() -> {
+                for (int j = 0; j < TURNS; j++) {
+                    x.incrementAndGet();
+                }
+                latch.countDown();
+            });
+        }
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        pool.shutdown();
+        float time = (System.currentTimeMillis() - start) / 1000F;
+        System.out.println("execution time: " + time);
+        System.out.println("result: " + x.get());
+
+    }
+}
+#+end_src
+
+#+begin_src java
+class TestLongAdderPerformance {
+    public static void test() {
+        final int TURNS = 100000000;
+        final int TASKS = 10;
+
+        ExecutorService pool = Executors.newCachedThreadPool();
+        LongAdder x = new LongAdder();
+        CountDownLatch latch = new CountDownLatch(TASKS);
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < TASKS; i++) {
+            pool.submit(() -> {
+                for (int j = 0; j < TURNS; j++) {
+                    x.add(1);
+                }
+                latch.countDown();
+            });
+        }
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        pool.shutdown();
+        float time = (System.currentTimeMillis() - start) / 1000F;
+        System.out.println("execution time: " + time);
+        System.out.println("result: " + x.longValue());
+    }
+}
+#+end_src
+
+#+begin_src java
+public class ComparePerformanceAdderVSCAS {
+    public static void main(String[] args) {
+        System.out.println("AtomicLong:");
+        TestAtomicLongPerformance.test();
+        System.out.println("LongAdder:");
+        TestLongAdderPerformance.test();
+    }
+}
+#+end_src
+
+我們看輸出結果:
+
+execution time: 18.796
+result: 1000000000
+
+LongAdder:
+execution time: 1.801
+result: 1000000000
+* Adder 和 Accumulator 的原理
+Atomic 類使用內的 value 變量保存著實際的值, 所有的操作都是針對該存空間進行的, 如果在高併發場景下, value 就是競爭的熱點, 重試的次數越多, CAS 失敗的機率越高, 從而導致惡性的 CAS 空自旋。
+
+Atomic 的 value:
+#+begin_src java
+public class AtomicInteger extends Number implements java.io.Serializable {
+    //,,,
+    private volatile int value;
+
+    /**
+     * Creates a new AtomicInteger with the given initial value.
+     *
+     * @param initialValue the initial value
+     */
+    public AtomicInteger(int initialValue) {
+        value = initialValue;
+    }
+    //...
+#+end_src
+
+Adder 和 Accumulator 的思路是將 value 的值分散到多個 slots 中, 每個線程根據 hashing 找到指定的槽, 並只對該 slots 操作, 從而避免競爭。 雖然這樣做多佔用了 N 個線程數的額外空間, 但是這點空間浪費是可以忽略不計的。
+
+Adder 和 Accumulator 包含一個 base 和一個 cells 數組, 在無競爭時, 只操作 base 值, 當有線程 CAS 失敗時, 才開始初始化 cells 數組。
+
+** add
+LongAdder:
+#+begin_src java
+    public void add(long x) {
+        Cell[] as; long b, v; int m; Cell a;
+        if ((as = cells) != null ||          // CASE 1
+            !casBase(b = base, b + x)) {  // CASE 2
+            boolean uncontended = true;
+            if (as == null || (m = as.length - 1) < 0 ||        // CASE 3
+                (a = as[getProbe() & m]) == null ||             // CASE 4
+                !(uncontended = a.cas(v = a.value, v + x)))  // CASE 5
+                longAccumulate(x, null, uncontended);
+        }
+    }
+#+end_src
+
+*** CASE 1 || CASE 2
+如果 CASE 1 成立, 代表之前曾經發生競爭, 會進入第二層 if 做 longAccumulate
+如果 CASE 1 不成立, 且 CASE 不成立, 則已經完成對 base 的 CAS 操作, 退出 add 方法
+如果 CASE 1 不成立, 且 CASE 成立, 說明發生第一次競爭, 對 base 的 CAS 操作失敗, 會進入第二層 if 做 longAccumulate
+
+*** CASE 3 || CASE 4 || CASE 5
+CASE 3 成立, 表示之前沒有初始化過 cells, 執行 longAccumulate(x, null, uncontended) 且 uncontended is true
+CASE 4 成立, 表示之前有初始化過 cells, 但是要操作的 Cell 對象沒有被初始化過, 執行 longAccumulate(x, null, uncontended) 且 uncontended is true
+
+CASE 3 不成立, CASE 4 不成立, 才會進行 CASE 5 的判斷:
+如果 CASE 5 的 CAS 成功, 則代表沒有競爭, 執行 longAccumulate(x, null, uncontended) 且 uncontended is true
+如果 CASE 5 的 CAS 失敗, 則敗表存在競爭, 執行 longAccumulate(x, null, uncontended) 且 uncontended is false
+
+如果 casBase 失敗, !casBase(b = base, b + x) 會 return true, 此時要對 cells 初始化。
+** longAccumulate
+longAccumulate 實現了分段鎖的思想, 代碼的主要邏輯如下:
+1. 能進入 longAccumulate 表示 cells 存在或是 casBase 失敗
+2. 整個 longAccumulate 依賴 for(;;) CAS 自旋, 分為三段邏輯:
+   * CASE 1: cells 被初始化過, 當前 thread 應該將數據寫入對應的 slot 中
+   * CASE 2: cells 沒有被初始化過, CAS 上鎖進行初始化, 初始化完後將 Cell 更新到 slot 中
+   * CASE 3: cells 沒有被初始化過, 有其他線程正在初始化 cells, 先嘗 casBase, 如果失敗後進到 CASE 1
+#+begin_src java
+    final void longAccumulate(long x, LongBinaryOperator fn,
+                              boolean wasUncontended) {
+        int h;
+        if ((h = getProbe()) == 0) {
+            ThreadLocalRandom.current(); // force initialization
+            h = getProbe();
+            wasUncontended = true;
+        }
+        // 擴容意向, false 表示不擴容
+        boolean collide = false;                // True if last slot nonempty
+
+        // CAS 直到成功
+        for (;;) {
+            Cell[] as; Cell a; int n; long v; // n = length, v = expect value
+            // CASE 1: 表示 cells 已經初始化過, 當前 thread 應該將數據寫入對應的 slot 中
+            if ((as = cells) != null && (n = as.length) > 0) {
+                // CASE 1.1:true 表示 slot 中的 Cell 為 null, 需要創建的 Cell
+                if ((a = as[(n - 1) & h]) == null) {
+                    if (cellsBusy == 0) {       // cells 不忙碌, 沒有處於 new 或擴容階段
+                        Cell r = new Cell(x);   // 只是準備好放進 slot 的 Cell, 真的要放進去要再次確認 cells 的情況
+                        if (cellsBusy == 0 && casCellsBusy()) { // 確認沒有其他線程將 cellsBusy 改為其他狀態, 執行 casCellsBusy 做 CAS 上鎖
+                            // 此時代表使得 cellsBusy 為 1 的線程是自己
+                            boolean created = false;
+                            try {               // Recheck under lock
+                                // 真正將 Cell 塞入 slot 中
+                                Cell[] rs; int m, j;
+                                if ((rs = cells) != null &&
+                                    (m = rs.length) > 0 &&
+                                    rs[j = (m - 1) & h] == null) {
+                                    rs[j] = r;
+                                    created = true;
+                                }
+                            } finally {
+                                // 無論成功與否都不再佔用 cells
+                                cellsBusy = 0;
+                            }
+                            if (created)
+                                // 成功的話就退出 for(;;) 了
+                                break;
+                            // 失敗了再試
+                            continue;           // Slot is now non-empty
+                        }
+                    }
+                    // if (cellsBusy == 0) 失敗
+                    collide = false;
+                }
+                // CASE 1.2, 表示 slot 中的 Cell 有東西
+                else if (!wasUncontended)       // CAS already known to fail
+                    // 如果 wasUncontended 是 false, 應該改為 true, 然後重入 for(;;)
+                    wasUncontended = true;      // Continue after rehash
+                // CASE 1.3, 表示 wasUncontended = true, 嘗試 CAS 修改 slot 的 Cell, 成功就 break
+                else if (a.cas(v = a.value, ((fn == null) ? v + x :
+                                             fn.applyAsLong(v, x))))
+                    break;
+                // CASE 1.4, 表示嘗試 CAS 修改 slot 的 Cell 失敗, 調整擴容意向
+                else if (n >= NCPU || cells != as)
+                    // 如果 slots 數量已經比 CPU 核數多, 則無法擴容
+                    // 如果 cells 已經過期 (被其他線程擴容), 則無法擴容
+                    // 調整為 false 後會重入 for(;;)
+                    collide = false;            // At max size or stale
+                // CASE 1.5, 表示可以擴容, 調整擴容意向為 true
+                else if (!collide)
+                    collide = true;
+                // CASE 1.6, 執行擴容
+                else if (cellsBusy == 0 && casCellsBusy()) {
+                    try {
+                        if (cells == as) {      // Expand table unless stale
+                            Cell[] rs = new Cell[n << 1];
+                            for (int i = 0; i < n; ++i)
+                                rs[i] = as[i];
+                            cells = rs;
+                        }
+                    } finally {
+                        cellsBusy = 0;
+                    }
+                    collide = false;
+                    continue;                   // Retry with expanded table
+                }
+                // rehash
+                h = advanceProbe(h);
+            }
+            // CASE 2: cells 是 null 且 CAS lock 成功
+            else if (cellsBusy == 0 && cells == as && casCellsBusy()) {
+                boolean init = false;
+                try {                           // Initialize table
+                    if (cells == as) {
+                        Cell[] rs = new Cell[2];
+                        rs[h & 1] = new Cell(x);
+                        cells = rs;
+                        init = true;
+                    }
+                } finally {
+                    cellsBusy = 0;
+                }
+                if (init)
+                    break;
+            }
+            // CASE 3: 有其他線程在初始化 cells, 先嘗試 CAS 更新到 base
+            else if (casBase(v = base, ((fn == null) ? v + x :
+                                        fn.applyAsLong(v, x))))
+                break;                          // Fall back on using base
+        }
+    }
+#+end_src
+** casCellsBusy 和 CAS 競爭顆粒度
+我們從 longAccumulate 知道, 只有 casCellsBusy() 成功時, 才會對整個 cells 上 CAS 鎖, 因此我們要考慮何時會調用 cellsBusy():
+1. cells 初始化時
+2. cells 擴容時
+3. 對 cells 的空 slot 新增 Cell 時
+關於第三點, 由於 slot 上是 null, null 對象是無法 CAS 操作的, 所以必須等到 slot 上有東西時, 才可以在 CASE 1 成立時, 只在對應的 slot CAS 自旋。
