@@ -10,6 +10,61 @@ JMM 中的定義的兩個概念:
    用於儲存當前方法的所有本地變量信息, 當線程使用變量時, 線程會去共享內存中複製一份變量複本到工作內存儲存中, 每個線程只能訪問自己的工作內存, 線程對變量的存取是對自己的工作內存中的複本存取, 也就是一個線程的說工作內存對其他線程來說是不可見的, 即使兩個線程是執行相同代碼, 他們也會在自己的工作內存中創建屬於自己的本地變量, 當然也包含字節碼, 行號指示器, 相關 native 方法的信息。 由於工作內存對其他線程是不可見的, 因此沒有線程安全問題。
 
 JMM 的大致規範如下:
-1. 所有變量存在主內存中
+1. 所有變量實例存在主內存中
 2. 每個線程有自己的獨立工作內存, 對變量的搓做都在工作內存中進行
-3. 不同內存不能直接訪問彼此的工作內存, 想訪問只能透過主內存來傳遞。
+3. 不同內存不能直接訪問彼此的工作內存, 想訪問只能透過主內存來傳遞
+* JMM 與 JVM 的區別
+JMM 屬於語言級別的概念模型, 它是一套保證可見性和有序性的一套協議, 確保程序在不同的編譯器和 CPU 平台上能夠提供相同的可見性與有序性保障。
+我們考慮以下方法:
+#+begin_src java
+int i = 0;
+public void mathod() {
+    i++;
+}
+#+end_src
+該代碼被編譯成字節碼後, 要完成三個步驟:
+1. 從主內存複製 i 的值到 CPU 的工作內存中
+2. CPU 讀取工作內存中的值, 然後進行 i++ 操作
+3. 將工作內存中的值, 寫回主內存中
+當多個線程都在存取 i 的時候, 比如線程 A 和 B 同時做完了 1, 2 步驟, 但是各自都在自己的工作內存中操作, 因此彼此的修改都是不可見的, 這個問題屬於 JMM 要解決的問題, JMM 解決這個問題的方式是提出一套規範, 或是協議, 讓我們在編寫代碼時知道怎麼透過代碼保證可見性和有序性; JVM 則是定義了一套指令集、一個虛擬計算架構和一個執行模型。 詳細的 JVM 內容我們將不在此展開。
+* JMM 與物理內存的關係
+物理內存有寄存器、多級緩存、主內存等, 並沒有工作內存和共享內存之分。 也就是說, JMM 對內存的劃分對物理內存並沒有實際影響, 工作內存和共享內存中都包含了這些物理內存, 以下是示意圖:
+[[./image/JMM-and-physical-memory.png]]
+* JMM 解決鍵性與有序性問題
+JMM 提供讓 JVM 按需限制使用 cache, 以及按需重排指令的方法, 這些方法包括 *volatile* 、 *synchronized* 、 *final* 以及 *Happens-Before* 規則。 volatile 與 final 約束了 cache 的使用時機, Happens-Before 的中心思想是, 前一個操作對後續的操作是可見的。嚴格來說, 它約束了 compiler 的優化行為。
+ * volatile 關鍵字借鑒自 C, 其功能是宣告該變量的存取不可以透過 cache, 必須從共享內存中存取。
+ * final 與 volatile 相反, 一個引用被宣告成 final 後由於不變性, JVM 會盡可能的優化, 包含使用 cache 與指令重排
+* Happens-Before 規則
+happens-before 如果翻譯為: 先行於, 很容易有所誤解。 happens-before 的正確理解應為: A happens-before B 等價於 A 如果先發生, 要確保 A 對數據的改動必須是 B 可見的, 這些原則同時約束了指令重排的順序以及規範了數據何時應被同步到主內存:
+1. As-if-Serial 順序性規則
+   在同一個線程中, 兩個有依賴的操作, 前面的操作 happens-before 於後續的任意操作。 因此如果兩個操作有依賴, 那麼先後次序不可重排。
+2. volatile 的規則
+   一個 volatile 變量的寫操作, happens-before 於 volatile 變量的讀操作。 因此如果 volatile 變量有讀和寫, 只要有寫入成功就必須可以被讀到。
+3. 遞移性規則
+   A happens-before B, 且 B happens-before C, 則 A happens-before C。
+4. synchronized 的規則
+   unlock 前的同步操作 happens-before lock 後的同步操作。 因此 unlock 前的操作必須對下一個 lock 之後的操作可見。
+5. 線程 start() 的規則
+   A 是主線程, 啟動子線程 B, 則 A 在 start 前的操作 happens-before B 的任意操作
+6. 線程 join() 的規則
+   A 是主線程, join 子線程 B, 則 B 的操作 happens-before join 的操作
+** 順序性, volatile 與 遞移性
+考慮以下代碼:
+#+begin_src java
+class VolatileExample {
+    int x = 0;
+    volatile boolean v = false;
+    public void write() {
+        x = 1;
+        v = true;
+    }
+    public void read() {
+        if (v == true) {
+            // x == ?
+        }
+    }
+}
+#+end_src
+1. 根據 *順序性規則*, x = 1 happens-before v = true
+2. 根據 *volatile 的規則*, v = true happens-before v == true
+3. 根據 *遞移性規則*, x = 1
