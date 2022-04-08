@@ -1,0 +1,170 @@
+#+TITLE: 樂觀鎖與 CLH 自旋鎖
+悲觀鎖總是假設最壞的情況, 進入臨界區時, 無論是讀操作還是寫操作, 都會對數據進行上鎖, 其他線程想要進入臨界區會被阻塞。 雖然獨占鎖對 *讀-讀* 併發場景都是排他的, 但是在關係型數據庫的較高的隔離級別場景依然會用到。 悲觀鎖機制存在以下問題:
+1. 吞吐量低: 一個線程進入臨界區後, 其他線程無法訪問相同的臨界資源, 吞吐量低
+2. 高延遲: 上鎖/釋放鎖會引發上下文切換的調度延時, 延遲高
+3. 優先級倒置: 如果優先級高的線程在等待優先級低的線程釋放鎖, 會引發優先級倒置, 從而導致飢餓問題
+
+解決方案則是使用樂觀鎖去代替悲觀鎖, 比如在關係型數據庫的場景, 使用 MVCC 樂觀鎖代替獨占鎖, 以獲得在 *讀-讀* 情況下的高併發性能。 Java 裡樂觀鎖機制都是基於 CAS 操作實現的, 由於 CAS 不會阻塞線程, 因此用 CAS 實現的樂觀鎖又稱為 *Non-Blocking synchronization 非阻塞同步*, 屬於 *Lock free* 的無鎖同步方案。
+* CAS 自旋鎖
+** 不可重入的自旋鎖
+實現不可重入的 CAS 自旋鎖非常簡單:
+1. 維持一個 AtomicReference <Thread> owner, 引用對象為 Thread
+2. lock 操作時獲得 currentThread t, 並期望 memory 中的值是 null, 如果是 null 則可以 CAS lock 成功
+3. unlock 時驗證 currentThread t 是不是擁有鎖的線程, 是才可以 unlock
+
+需要注意的地方:
+1. AtomicReference<Thread> onwer 不可以是 static 的, 因為不同的 SpinLock 對象是獨立的
+2. 自旋失敗時, 以 Thread.yield() 放棄此次調度
+3. unlock 要做身份檢查, 確認自己為 onwer 才可以 unlock
+
+#+begin_src java
+public abstract class SpinLock implements Lock {
+    private final AtomicReference<Thread> onwer = new AtomicReference<>();
+
+    @Override
+    public void lock() {
+        Thread t = Thread.currentThread();
+        while (onwer.compareAndSet(null, t)) {
+            Thread.yield();
+        }
+    }
+
+    @Override
+    public void unlock() {
+        Thread t = Thread.currentThread();
+        if (t == onwer.get()) {
+            onwer.set(null);
+        }
+    }
+}
+#+end_src
+** 可重入的自旋鎖
+可重入的自旋鎖實現邏輯如下:
+1. 維持一個 AtomicReference <Thread> owner, 引用對象為 Thread
+2. 維持一個 count, 紀錄重入次數
+3. lock 時, 先確認自己是不是重入線程, 是的話直接 count ++ 返回, 如果不是則進行 CAS 嘗試
+4. unlock 時, 先確認自己是不是重入線程, 如果是的話直接 count -- 返回, 如果 count == 0 的話將 owner 設置成 null
+
+需要注意的地方:
+count 不需要設置成 volatile, 因為只有在 owner 是自己時才會存取 count 的值, 而 AtomicReference 裡維持的 value 已經以 volatile 修飾過了, 因此這樣的操作是內存可見的:
+1. volatile 規則: volatile 變量的寫 happens-before volatile 變量的讀
+2. As-if-Serial 規則: owner.get() happens-before count ++
+3. 遞移性規則: volatile 變量的寫 happens-before count ++
+
+#+begin_src java
+public abstract class ReentrantSpinLock implements Lock {
+    private final AtomicReference<Thread> owner = new AtomicReference<>();
+    private int count = 0;
+
+    @Override
+    public void lock() {
+        Thread t = Thread.currentThread();
+        if (t == owner.get()) {
+            count ++;
+            return;
+        }
+        while (owner.compareAndSet(null, t)) {
+            Thread.yield();
+        }
+    }
+
+    @Override
+    public void unlock() {
+        Thread t = Thread.currentThread();
+        if (t == owner.get()) {
+            if (count > 0) {
+                count --;
+            } else {
+                owner.set(null);
+            }
+        }
+    }
+}
+#+end_src
+** 緩存一致性流量 與 Bus 風暴
+在 MESI 協議裡有說到, 為保障緩存的一致性, 我們需要透過 Bus 來同步不同的 CPU 緩存的數據, 這種需要透過 Bus 來傳輸的數據稱為緩存一致性流量, 當緩存一致性流量過大, 就會產生而 Bus 風暴, 而 Java 的 volatile 與 CAS 操作就會產生緩存一致性流量。 Java 的隱式鎖輕量級鎖, 在激烈競爭時會膨脹成重量級鎖, 其目的也有兩個, 一是避免 CPU 空自旋, 二也是為了避免 Bus 風暴。
+* CLH 自旋鎖
+CLH 自旋鎖是透過隊列排隊來降低 CAS 競爭, 以普通的 while 自旋來代替 CAS 自旋, 這個概念由 Craig、Landin 和 Hagersten 一起提出, 因此被命名為 CLH 自旋鎖。
+CLH 會維護一個 linked list, 並規定只有對 tailNode 操作是 CAS 自旋, 其他的自旋必須是普通自旋:
+1. 假設 A 需要自旋, A 對 tailNode (此時是 EMPTY) 以 CAS 方式新增一個 Node, 並在 preNode (此時是 EMPTY) 進行 while(preNode.isLocked()) 自旋
+2. 假設 B 需要自旋, B 對 tailNode (此時是 A) 以 CAS 方式新增一個 Node, 並在 preNode (此時是 A) 進行 while(preNode.isLocked()) 自旋
+3. ...
+
+** CLHSpinLock 原理
+CLHSpinLock 基本結構:
+#+begin_src java
+public class CLHSpinLock implements Lock {
+    private static final TheadLocal<Node> curNodeLocal = new ThreadLocal<>();
+    private AtomicReference<Node> tail = new AtomicReference<>(null);
+
+    public CLHSpinLock(){
+        tail.getAndSet(Node.EMPTY);
+    }
+
+    static class Node {
+
+        volatile boolean locked;
+        Node preNode;
+        public static final Node EMPTY = new Node(false, null);
+
+        public Node (boolean locked, Node preNode){
+            this.locked = locked;
+            this.preNode = preNode;
+        }
+    }
+}
+#+end_src
+
+lock 時:
+1. new 一個 Node, 用於 CAS 入隊列
+2. 在 tail CAS 自旋入隊列, 如果失敗要更新 tail
+3. tail CAS 成功, 在 preNode 上進行普通 while 自旋
+4. 普通自旋成功, 說明 preNode 已經 unlock, 此時已經獲得鎖了
+5. 將自己註冊為 ThreadLocal 的 curNodeLocal 的 Node
+#+begin_src java
+public void unlock() {
+    Node curNode = new Node(true, null);
+    Node preNode = tail.get();
+    while(!tail.compareAndSet(preNode, curNode)) {
+        // cas 失敗時, 要更新 preNode 期望值
+        preNode = tail.get();
+    }
+
+    // cas 成功
+    curNode.setPreNode(preNode);
+
+    // 普通自旋
+    while(curNode.getPreNode().isLocked()) {
+        Thread.yield();
+    }
+
+    // 正式獲得 lock
+    curNodeLocal.set(curNode);
+}
+#+end_src
+
+注意最後一步: 將自己註冊為 ThreadLocal 的 curNodeLocal 的 Node
+這是為了 unlock 時方便做檢查, 因為如果沒有 lock 成功, 當前的 curNodeLocal 沒有註冊任何 Node, 而如果 lock 成功, curNodeLocal 註冊的一定是當前線程的 Node
+
+當 unlock 時:
+1. 從 curNodeLocal 獲得當前線程的 curNode
+2. 釋放 preNode, 因為 preNode 已經徹底沒用了
+3. 釋放 curNodeLocal 的 Node, 相當於為本線程清空 ThreadLocal 的對象
+4. curNode 的 locked 設置為 false, 讓後面以普通 while 自旋在當前 curNode 的線程獲得鎖
+#+begin_src java
+public void unlock() {
+    Node curNode = curNodeLocal.get();
+    curNode.setPreNode(null);
+    curNode.set(null);
+    curNode.setLocked(false);
+}
+#+end_src
+
+** 可見性與有序性保證
+注意, 每個 Node 的 locked 必須是 volatile 的, 因為後面 while 普通自旋在當前 curNode 的 locked 上, 我們必須保證它的修改是可見的
+** CLH 自旋鎖的特性
+1. 大幅降低 CAS 的次數
+   只有在嘗試入隊列時會有 CAS 自旋, 只要入隊列後就都是普通 while 自旋
+2. 空間複雜度低
+   如果有 N 個線程, 有 L 個鎖, 每個線程一次只獲得一個鎖, 那麼空間複雜度為 O(N + L), 因為 N 個線程最多有 N 個 Node, 而 L 個鎖最多有 L 個 tail
+3. 在 NUMA 架構的 CPU 性能差

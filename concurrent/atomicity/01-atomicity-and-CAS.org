@@ -1,4 +1,46 @@
-#+TITLE: Compare-And-Swap
+#+TITLE: 原子性問題與 Compare-And-Swap
+* Atomicity
+我們可以從一個例子出發, 來理解原子性的問題:
+#+begin_src java
+public class AtomicityDemo {
+    private static class SyncedIncrement {
+        volatile int value = 0;
+
+        public synchronized int get() {
+            return value;
+        }
+        public synchronized void set(int i) {
+            value = i;
+        }
+        public synchronized void add(int i) {
+            set(get() + i);
+        }
+    }
+
+    final static ExecutorService pool = Executors.newFixedThreadPool(10);
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(1000);
+        SyncedIncrement demo = new SyncedIncrement();
+        for (int i = 0; i < 1000; i++) {
+            pool.submit(() -> {demo.add(1);});
+            latch.countDown();
+        }
+        pool.shutdown();
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        System.out.println("result: " + demo.get());
+    }
+}
+
+#+end_src
+輸出結果為:
+result: 686
+
+SyncedIncrement 所有的方法都是 synchronized 的, 並且我們操作的 value 對象, 是以 volatile 修飾, 我們期望 pool.submit(() -> {demo.add(1);}); 時, 這個操作是線程安全的, 但是這樣的操作卻是線程不安全的, 原因在於: 由於線程僅有 10 個, 確有 1000 個 task, 這樣會使得 set(get() + i); 發生線程切換, 從而破壞了原子性。 原子性的保障, 必須透過 CAS 操作完成, 僅透過隱式鎖與 volatile 是不夠的。
+
 * Compare-And-Swap (CAS)
 由於重量級鎖是透過 OS 的 mutex_lock 實現的, 這是一種 system call, 會引發用戶態/內核態的切換, 因此開銷大、性能低。 而輕量級鎖是使用 Compare-and-Swap CAS 的方式自旋搶鎖, 這個過程是 CPU 指令級別的原子操作, 過程中不發生用戶態/內核態的切換, 因此開銷很低。 CAS 是一種無鎖的算法:
 1. 透過 Object 的 offset 得到要 CAS 操作的 attribute 在內存中的值 (Compare)

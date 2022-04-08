@@ -1,0 +1,205 @@
+#+TITLE: 獨占鎖與共享鎖
+ * 獨占鎖
+   鎖同時只能被 1 個線程持有, 一個線程成功上鎖進入臨界區後, 任何其他線程嘗試上鎖都會被阻塞, 直到被 notify 後可以再嘗試上鎖, 或是被 interrupt。 也就是說, 共享資源只能同時被一個線程訪問, Java 的 implicit lock 和 ReentrantLock 都是獨占鎖。
+
+ * 共享鎖
+   鎖可以同時被多個線程持有, 但是進入臨界區的線程只能讀取臨界區資源, 不能修改。 JUC 的共享鎖包含: Semaphore, ReadLock
+
+ * Semaphore
+   Semaphore 可以用來控制進入臨界區的線程數量, 通過發信號的方式通知協調線程對鄰接資源的合理使用。 Semaphore 內部維護了一組權限 *permits*, 這個數量可以透過 constructor 傳入參數指定, 進入臨界區時線程必須使用 Semaphore 的 acquire() 來獲得許可, 如果 *permits* 數量為 0 則會被阻塞, 當線程要離開臨界區時, 也必須調用 release() 歸還 permits
+
+* Semaphore 基本結構
+ * constructor
+   Semaphore 的 constructor 必須傳入 permits 數量, 並且默認是非公平鎖:
+#+begin_src java
+    public Semaphore(int permits) {
+        sync = new NonfairSync(permits);
+    }
+    public Semaphore(int permits, boolean fair) {
+        sync = fair ? new FairSync(permits) : new NonfairSync(permits);
+    }
+#+end_src
+ * acquire
+   acquire 的每一種方式都有兩種版本:
+    1. 獲得 1 個 permit
+    2. 獲得 N 個 permit, 這是用來協調覆載; 比如說不同的方法對 permit 的需求量不同, 覆載重的任務應該要佔用更多 permit
+
+   分類:
+    1. 以 blocked 且 interruptable 的方式
+    2. 以 blocked 且 uninterruptable 的方式
+    3. 嘗試 lock 失敗後立即返回
+    4. 嘗試 lock 失敗後,阻塞等待 timeout 時間後返回
+    5. 取得剩下所有的 permits
+#+begin_src java
+    // 1. 以 blocked 且 interruptable 的方式
+    public void acquire() throws InterruptedException {
+        sync.acquireSharedInterruptibly(1);
+    }
+    public void acquire(int permits) throws InterruptedException {
+        if (permits < 0) throw new IllegalArgumentException();
+        sync.acquireSharedInterruptibly(permits);
+    }
+
+    // 2. 以 blocked 且 uninterruptable 的方式
+    public void acquireUninterruptibly() {
+        sync.acquireShared(1);
+    }
+    public void acquireUninterruptibly(int permits) {
+        if (permits < 0) throw new IllegalArgumentException();
+        sync.acquireShared(permits);
+    }
+
+    // 3. 嘗試 lock 失敗後立即返回
+    public boolean tryAcquire() {
+        return sync.nonfairTryAcquireShared(1) >= 0;
+    }
+    public boolean tryAcquire(int permits) {
+        if (permits < 0) throw new IllegalArgumentException();
+        return sync.nonfairTryAcquireShared(permits) >= 0;
+    }
+
+    // 4. 嘗試 lock 失敗後,阻塞等待 timeout 時間後返回
+    public boolean tryAcquire(long timeout, TimeUnit unit)
+        throws InterruptedException {
+        return sync.tryAcquireSharedNanos(1, unit.toNanos(timeout));
+    }
+    public boolean tryAcquire(int permits, long timeout, TimeUnit unit)
+        throws InterruptedException {
+        if (permits < 0) throw new IllegalArgumentException();
+        return sync.tryAcquireSharedNanos(permits, unit.toNanos(timeout));
+    }
+
+    // 5. 取得剩下所有的 permits
+    public int drainPermits() {
+            return sync.drainPermits();
+        }
+
+#+end_src
+ * release
+#+begin_src java
+    public void release() {
+        sync.releaseShared(1);
+    }
+    public void release(int permits) {
+        if (permits < 0) throw new IllegalArgumentException();
+        sync.releaseShared(permits);
+    }
+#+end_src
+ * 與 Samephore 狀態相關的方法
+   1. 查看可用的 permits
+   2. 減少 permits 總量
+   3. 查看是否有線程被 blocked 在 Queue 上
+   4. 查看有多少線程被 blocked 在 Queue 上
+   5. 取得被 blocked 在 Queue 上的線程
+#+begin_src java
+    public int availablePermits() {
+            return sync.getPermits();
+    }
+    protected void reducePermits(int reduction) {
+        if (reduction < 0) throw new IllegalArgumentException();
+        sync.reducePermits(reduction);
+    }
+    public final boolean hasQueuedThreads() {
+        return sync.hasQueuedThreads();
+    }
+    public final int getQueueLength() {
+        return sync.getQueueLength();
+    }
+    protected Collection<Thread> getQueuedThreads() {
+        return sync.getQueuedThreads();
+    }
+#+end_src
+* 用 Samephore 模擬讀寫鎖
+我們以 Samephore 模擬讀寫鎖為案例來熟悉 Samephore 的使用:
+1. 讀取 value 時不阻塞其他讀取, 但阻塞其他寫入
+2. 寫入時阻塞其他線程的讀取與寫入
+
+讀取和 update 時都 sleep 一秒:
+#+begin_src java
+public class SemaphoreReadWriteDemo {
+    private final Semaphore semaphore = new Semaphore(65536, true);
+    volatile int value = 0;
+    int getValue() throws InterruptedException {
+        long start = System.currentTimeMillis();
+        semaphore.acquire();
+        int res = value;
+        sleep(1000);
+        semaphore.release();
+        long time = System.currentTimeMillis() - start;
+        System.out.println("get value spent: " + time);
+        return res;
+    }
+    void update() throws InterruptedException {
+        long start = System.currentTimeMillis();
+        semaphore.acquire(65536);
+        value ++;
+        sleep(1000);
+        semaphore.release(65536);
+        long time = System.currentTimeMillis() - start;
+        System.out.println("update spent: " + time);
+    }
+}
+#+end_src
+
+執行時, 先執行 3 次讀, 然後進行 3 次 update, 再進行 3 次讀:
+#+begin_src java
+    public static void main(String[] args) {
+        SemaphoreReadWriteDemo demo = new SemaphoreReadWriteDemo();
+        ExecutorService pool = Executors.newCachedThreadPool();
+        CountDownLatch latch = new CountDownLatch(9);
+        for (int i = 0; i < 3; i++) {
+            pool.submit(() -> {
+                try {
+                    System.out.println("get: " + demo.getValue());
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            });
+            latch.countDown();
+        }
+        for (int i = 0; i < 3; i++) {
+            pool.submit(() -> {
+                try {
+                    demo.update();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            });
+            latch.countDown();
+        }
+
+        for (int i = 0; i < 3; i++) {
+            pool.submit(() -> {
+                try {
+                    System.out.println("get: " + demo.getValue());
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            });
+            latch.countDown();
+        }
+        pool.shutdown();
+    }
+#+end_src
+
+執行結果:
+1. 三次讀沒有被阻塞, 只花費 1 秒:
+   get value spent: 1000
+   get: 0
+   get value spent: 1000
+   get: 0
+   get value spent: 1000
+   get: 0
+
+2. 三次寫, 被 3 次讀阻塞, 並且被自己的寫入阻塞:
+   update spent: 2000
+   update spent: 3000
+   update spent: 4000
+
+3. 三次讀, 由於被 3 次寫阻塞, 因此也被之前的讀阻塞, 但此次讀不阻塞:
+   get value spent: 5000
+   get: 3
+   get value spent: 5000
+   get: 3
+   get value spent: 5000
+   get: 3

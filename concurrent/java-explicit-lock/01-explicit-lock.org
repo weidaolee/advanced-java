@@ -1,0 +1,278 @@
+#+TITLE: Java 的顯式鎖
+使用 Java 的隱式鎖時, 鎖的膨脹機制、鎖的 Monitor 的搶佔和釋放, 都是由 JVM 來完成, 在語言層面我們只宣告 synchronized 的對象和範圍, 不需要在語言層面做額外的控制。 隱式鎖的機制讓 Java 的代碼能更聚焦在業務邏輯上, 但是隱式鎖的功能相對單一, 不具備一些能讓併發任務更高級的功能, 比如:
+1. 支持超時: 為了避免過長的飢餓問題, 讓達到飢餓超時的線程拋出異常返回
+2. 支持響應中斷: 一種死鎖問題的解決方案是, 讓其中一個線程響應中斷信號, 避免無限等待下去
+3. 支持非阻塞獲取鎖: 讓上鎖失敗的線程拋出異常返回, 而不是進入阻塞等待
+
+* Lock interface
+Lock 是 JUC 提供的 Lock interface, 其中:
+1. lock, unlock: 對應著隱式鎖的上鎖失敗進入阻塞等待, 與釋放鎖, 這兩個方法提供我們 *顯式、主動的* 上鎖與釋放鎖
+2. lockInterruptibly: 支持響應中斷異常, 能用於避免死鎖的一種解決方案
+3. tryLock: 有兩種 overload 版本, 提供了非阻塞上鎖與支持超時上鎖
+4. newCondition: 提供了對應 Monitor 的同步機制: Waite-Notify 機制
+
+#+begin_src java
+public interface Lock {
+    void lock();
+    void unlock();
+
+    void lockInterruptibly() throws InterruptedException;
+
+    boolean tryLock();
+    boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
+
+    Condition newCondition();
+}
+#+end_src
+
+JUC 裡有相當多的鎖都 implements 了 Lock:
+[[./image/Lock-uml.png]]
+* Lock 的可見性保證
+我們考慮以下代碼可見性是否是有保證的:
+#+begin_src java
+public class LockHappensBeforeDemo {
+    final static Lock lock = new ReentrantLock();
+    final static ExecutorService pool = Executors.newCachedThreadPool();
+    static int value = 0;
+
+    public static void main(String[] args) {
+        CountDownLatch latch = new CountDownLatch(10);
+        for (int i = 0; i < 10; i++) {
+            pool.submit(() -> {
+                lock.lock();
+                try {
+                    for (int j = 0; j < 1000; j++) {
+                        value ++;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            });
+            latch.countDown();
+        }
+        pool.shutdown();
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        System.out.println("result:" + value);
+    }
+}
+#+end_src
+
+假設有線程 A, B:
+1. 根據 As-if-Serial 規則, A 線程的 value ++; happens-before A 線程的 unlock();
+2. 根據 lock/unlock 規則, A 線程的 unlock() happens-before B 線程的 lock();
+3. 根據 遞移性規則, A 線程的 value ++ happens-before B 線程的 lock();
+
+注意, 這裡的 lock/unlock 規則, 是 ReentrantLock 裡實現的, 它透過 volatile 規則模擬 synchronized 的 unlock happens-before lock 規則:
+#+begin_src java
+class SampleLock {
+  volatile int state;
+
+  lock() {
+    if(!state == 0) {
+        // error
+    }
+    //...
+    state = 1;
+  }
+
+  unlock() {
+    //...
+    state = 0;
+  }
+}
+#+end_src
+在使用 lock/unlock 時, 根據 volatile 規則: 如果有線程 unlock(), 則 state = 0 happens-before 其它線程的在 lock() 裡的 if(!state == 0), 從而作到了與 synchronized 的 unlock happens-before lock 規則
+* Lock 的使用範式
+使用顯式鎖必須遵守一些範式, 這是因為顯式鎖必須由開發者自己完成鎖的申請與釋放, 透過申請不同的鎖: 阻塞的鎖、立刻返回的鎖、超時返回的鎖、可中斷的鎖等, 來完成各種不同的併發需求。
+** lock
+#+begin_src java
+//...
+lock.lock();
+try {
+    // critical section
+} finally {
+    lock.unlock();
+}
+#+end_src
+
+這種範式的思想是:
+1. 以 try {...} 捕獲臨界區代碼的異常
+2. 能觸發異常的, 只有臨界區的代碼
+3. 有 lock.lock() 就一定要有 lock.unlock()
+
+為了實現這個思想:
+1. 臨界區必須包含在 try {...} 內
+   這是為了在執行臨界區的代碼時, 允許執行臨界區代碼的線程拋出異常
+2. lock.unlock() 必須在 finally {...} 內被執行
+   這是為了保證無論是否有觸發異常, 都要確保 lock 被釋放
+3. locl.lock() 必須在 try {...} 之外
+   由於 try {...} 只是用於捕獲臨界區代碼的異常, 而 lock.lock() 是一種申請鎖的行為, 如果申請失敗了就不會 lock.lock(), 也就不需要 lock.unlock()
+4. lock() 與 try {...} 之間禁止有任何代碼
+   如果 lock.lock() 成功, 就必須有 unlock(), 如果 lock.lock() 與 try {...} 之有任何代碼, 有可能觸發其他異常導致沒有進入 finally {...} 進行 lock.unlock()
+** tryLock
+tryLock 有兩種 overload 版本:
+#+begin_src java
+    boolean tryLock();
+    boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
+#+end_src
+這兩種版本都 return boolean, 這是用於嘗試失敗時, 能透過 return 的結果做相應的處理:
+#+begin_src java
+if (lock.tryLock()) {
+    try {
+        // critical section
+    } finally {
+        lock.unlock()
+    }
+} else {
+    //...
+}
+#+end_src
+1. lock.tryLock() 必須在 if (...) 內
+   由於 lock.tryLock() 會 return boolean, 如果 return false 表示嘗試失敗, 進入 else {...}
+2. 處裡上鎖失敗的邏輯必須在 else {...} 內
+   上鎖失敗, 沒有進入臨界區, 線程應該處在 RUNNABLE 狀態
+* Condition interface
+當我們的要鎖的對象不只一個的時候, 我們需要透過線程間通信來協調鎖的資源的申請與釋放, 在隱式鎖我們透過 wait(), notify(), notifyAll() 來完成, 而在顯式鎖是透過 implements 了 Condition 的 concrete class 來完成, 但 Condition 為了避免與隱式鎖的 Waite-Notify 混搖, Condition 的方法都做了重命名:
+#+begin_src java
+public interface Condition {
+
+    void await() throws InterruptedException;
+
+    void awaitUninterruptibly();
+
+    long awaitNanos(long nanosTimeout) throws InterruptedException;
+
+    boolean await(long time, TimeUnit unit) throws InterruptedException;
+
+    boolean awaitUntil(Date deadline) throws InterruptedException;
+
+    void signal();
+    void signalAll();
+}
+#+end_src
+
+以下是透過 Condition 來完成線程間通信的案例:
+#+begin_src java
+public class ConditionDemo {
+    static Lock lock = new ReentrantLock();
+    static private final Condition condition = lock.newCondition();
+
+    private static class WaitThread implements Runnable {
+        @Override
+        public void run() {
+            lock.lock();
+            try {
+                System.out.println("I am WaitThread, start waiting...");
+                condition.await();
+                System.out.println("I am WaitThread, I was notified!");
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+    private static class NotifyThread implements Runnable {
+        @Override
+        public void run() {
+            lock.lock();
+            try {
+                System.out.println("I am NotifyThread, now I want to do something in critical section...");
+                sleep(1000);
+                System.out.println("I am NotifyThread, now I notify the WaitThread, but I still hava lock...");
+                condition.signal();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                lock.unlock();
+                System.out.println("I am NotifyThread, now I release the lock...");
+            }
+        }
+    }
+    public static void main(String[] args) throws InterruptedException {
+        Thread waitThread = new Thread(new WaitThread());
+        Thread notifyThread = new Thread(new NotifyThread());
+
+        waitThread.start();
+        sleep(1000);
+        notifyThread.start();
+    }
+}
+#+end_src
+
+* LockSupport
+JUC 提供了阻塞/喚醒線程的方法, 這些方法很接近 Thread.sleep(), 只是這些方法被時現在 LockSupport 裡:
+#+begin_src java
+public static void park();
+public static void parkNanos(long nanos);
+public static void parkUntil(long deadline);
+
+public static void park(Object blocker);
+public static void parkNanos(Object blocker, long nanos);
+public static void parkUntil(Object blocker, long deadline);
+
+public static void unpark(Thread thread);
+#+end_src
+
+park() 類的方法用於阻塞當前線程, unpark() 類的方法用於喚醒線程, 另外 park() 類方法有 Object blocker 版本, 提供分析阻塞的原因, 基本的使用如下:
+#+begin_src java
+public class LockSupportDemo {
+    private static class ParkDemoThread extends Thread {
+        public ParkDemoThread(String name) {
+            super(name);
+        }
+
+        @Override
+        public void run() {
+            System.out.println( getName() +  " is parked...");
+            LockSupport.park();
+            if (Thread.currentThread().isInterrupted()) {
+                System.out.println(getName() + " is interrupted but will continue execution...");
+            } else {
+                System.out.println( getName() +  " is unparked...");
+            }
+            System.out.println( getName() +  " done.");
+        }
+    }
+
+    public static void main(String[] args) {
+        Thread t1 = new ParkDemoThread("T1");
+        Thread t2 = new ParkDemoThread("T2");
+
+        t1.start();
+        t2.start();
+
+        t1.interrupt();
+        LockSupport.unpark(t2);
+    }
+}
+#+end_src
+ * park 與 sleep 的區別
+   1. sleep 不能從外部被喚醒, 進入 sleep 的 thread 只能自己醒過來, 所以必須有 timeout; 而 park 可以以 unpark 通知喚醒, 也可以 timeout 醒過來
+   2. sleep 的簽名包含 InterruptedException, 必須捕獲或拋出中斷異常; 而 park 沒有捕獲中斷異常, 被 interrupt 的線程只是重設了 interrupt flag
+ * park 與 wait 的區別
+   1. park 更接近 sleep, park 進入阻塞不會釋放鎖, 但是 wait 會
+   2. park 更接近 sleep, park 可以在任意地方被執行, 但是 wait 只能在 synchronized 內
+   3. unpark 對沒有被 park 的線程執行是合法的, 但不起任何作用, 而如果沒有線程執行 Object.wait() 就調用 Object.notify() 會觸發 IllegalMonitorStateException
+   4. park/unpark 的對象是線程, wait/notify 的對象是 Object 的 Monitor
+* 顯式鎖的分類
+顯示鎖的不同分類方式有以下幾種: 不可重入鎖和可重入鎖, 悲觀鎖和樂觀鎖, 公平鎖和非公平鎖, 獨占鎖和共享鎖, 不可中斷鎖與可中斷鎖。
+ * 不可重入鎖和可重入鎖
+   所謂可重入鎖, 指的是一個線程可以對一個鎖對象重複上鎖。 比如線程 A 在進入外層函數獲得了鎖, 當線程繼續內層函數時, 如果遇到有相同鎖的臨界區, 線程 A 依然可以獲得該鎖, 相反的, 不可重入的鎖就無法獲得該鎖。
+
+ * 悲觀鎖與樂觀鎖
+   悲觀鎖和樂觀鎖是依照悲觀和樂觀的態度決定對進入臨界區之前是否鎖住臨界區資源來區分。
+   悲觀鎖認為, 臨界區的資源通常會被修改, 所以進入臨界區前會上鎖, 這樣就可以阻塞其他線程。 總體來說, 悲觀鎖適合寫多讀少的場景, 遇到高併發寫入時性能較高, Java 的 synchronized 隱式重量級鎖就是悲觀鎖。
+   樂觀鎖認為, 臨界區的資源不太會被修改, 所以進入臨界區前不上鎖, 但在更新數據前判斷一下是否數具有被更新, 並且要比較版本號相同才可以做更新, 如果失敗了就必須重來。 總體來說樂觀鎖適用於讀多寫少的場景, 高併發讀時性能較高, Java 的樂觀鎖大多是用 CAS 實現的, Java 的隱式輕量級鎖, JUC 基於 AQS 的顯式鎖如 ReentrantLock 都是樂觀鎖。
+
+ * 公平鎖與非公平鎖
+   如果獲得鎖的機會是依照 FIFO 順序, 那麼就是公平鎖。 非公平鎖的優點是擁有比公平鎖更好的吞吐量, 但缺點是有可能導致優先級倒置或飢餓問題。
+ * 不可中斷鎖與可中斷鎖
+   如果一個鎖被 A 線程佔有, B 線程就只能選擇阻塞或等待, 就是不可中斷鎖; 如果線程 B 等待時間過長想要中斷去處理其他事情, 我們可以讓 B 中斷自己的阻塞等待, 就是可中斷鎖。 簡單來說, 可中斷鎖就是可透過某些方式中止搶佔過程, 就是可中斷鎖。 兩種鎖有可能會引發不同的活躍性問題: 不可中斷鎖可能會引發死鎖問題, 可中斷鎖要注意活鎖問題。
+
+ * 獨占鎖與共享鎖
+   如果存取臨界區資源都必須獲得鎖才能進行, 那這種鎖就是獨占鎖; 如果存取臨界資源只有寫入時才須獲得鎖, 對讀取操作不做限制, 則是共享鎖。 ReentrantLock 是獨占鎖, 而 ReentrantReadWriteLock 是共享鎖, 雖然 ReentrantLock 更簡單的保證了線程安全問題, 但是獨占鎖不必要的限制了 *讀-讀* 競爭, 因為 *讀-讀* 競爭並不會有數據不一致的問題, 但是併發性能較低。
