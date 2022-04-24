@@ -1,0 +1,266 @@
+#+TITLE: 讀寫鎖
+在一般的併發場景中, 通常是以一把鎖保護一個或多個臨界資源, 較少有多把鎖保護相同臨界資源的場景, 原因是不同的鎖之間的關係是獨立的、相互之間不排他的。 而讀寫鎖的特別之處就在於, 讀寫鎖使用兩把鎖保護相同的臨界資源, 但是這兩把鎖相互之間是不獨立的, 兩把鎖的關係如下:
+ * read lock
+   用於對讀取行為上鎖, 成功上鎖的條件為沒有其他線程持有 write lock
+ * write lock
+   用於對寫入行為上鎖, 成功上鎖的條件為沒有其他線程持有 read lock 和 write lock
+
+讀寫鎖將對臨界區資源的存取行為分為讀和寫, 並且樂觀地假設在讀時數據並不容易發生改變。 在這樣的假設下能在讀多寫少的場景獲得更高的併發能力, 因為讀場景之間不發生阻塞。 在共享鎖章節我們透過 Semaphore 實現了讀寫鎖, 在本章節我們討問 JUC 提供的讀寫鎖, 包含 ReadWriteLock 和 StampedLock。
+* ReadWriteLock
+JUC 的讀寫鎖也區分抽象的 interface: ReadWriteLock 和其對應的 concrete class: ReentrantReadWriteLock。
+
+ReadWriteLock 只包含了獲取讀鎖的 readLock() 方法和獲取寫鎖的 writeLock() 方法, 在使用時, 主動的對臨界資源的讀取行為上 readLock, 對寫入行為上 writeLock。
+#+begin_src java
+public interface ReadWriteLock {
+    /**
+     * Returns the lock used for reading.
+     *
+     * @return the lock used for reading
+     */
+    Lock readLock();
+
+    /**
+     * Returns the lock used for writing.
+     *
+     * @return the lock used for writing
+     */
+    Lock writeLock();
+}
+#+end_src
+*ReadWriteLock 只有包含這兩個方法, 也就是說, 對於 JUC 的讀寫鎖, 就僅僅只是透過控制兩把鎖: 一把鎖為 S 鎖, 用於保護讀取行為; 另一把是 X 鎖, 用於保護寫入行為, 但是要注意, 任意封裝兩把鎖並 implement ReadWriteLock 無法實現真正的讀寫鎖的功能, 因為前面提到, 任意兩把鎖相互之間是獨立的, 而 ReadWriteLock 的兩把鎖相互之間是有條件排他的。*
+** 使用 ReetrantReadWriteLock 實現緩存按需加載
+緩存按需加載的需求如下:
+1. 存取時先考慮緩存中是否有數據, 沒有的話必須先加載數據
+2. 讀取行為之間不阻塞, 寫入行為必須阻塞其他讀寫
+
+注意, 當緩存沒命中時, 才需要上 write lock, 上 write lock 時需要再次檢查緩存是否命中, 因為在成功獲取 write lock 前有可能是被別的線程的阻塞住, 當成功可能已經將數據加載到緩存:
+#+begin_src java
+abstract public class ReadWriteLockLazyLoadCache<K,V> {
+    final Map<K,V> cache = new HashMap<>();
+    final ReentrantReadWriteLock rwlock = new ReentrantReadWriteLock();
+    final Lock rlock = rwlock.readLock();
+    final Lock wlock = rwlock.writeLock();
+
+    V get(K key) {
+        V val = null;
+
+        // 嘗試讀取緩存
+        rlock.lock();
+        try {
+            val = cache.get(key);
+        } finally {
+            rlock.unlock();
+        }
+
+        if (val != null) {
+            return val;
+        }
+
+        // 緩存未命中
+        wlock.lock();
+        try {
+            // 二次驗證緩存是否命中
+            val = cache.get(key);
+            if (val != null) {
+                return val;
+            }
+
+            // 確定緩存未命中, 加載數據
+            val = loadFromDatabase(key);
+
+            // 更新緩存
+            cache.put(key, val);
+        } finally {
+            wlock.unlock();
+        }
+        return val;
+    }
+
+    abstract V loadFromDatabase(K key);
+}
+#+end_src
+
+** ReadWriteLock 的升級與降級
+讀寫鎖的升級與降級指的是 read lock 和 write lock 的切換:
+ * upgrading
+   指讀鎖升級為寫鎖。 當持有 read lock 且在還沒 unlock 前, 先持有 write lock 然後 unlock read lock 完成從讀鎖切換成讀鎖, 稱之為 upgrading。 JUC 的 ReadWriteLock 禁止 upgrading, 因為這樣會導致 deadlock: 兩個持有 read lock 的線程都想 upgrading 成 write lock, 但想要獲得 write lock 必須等其他線程釋放所有的 read lock 和 write lock。
+ * downgrading
+   指寫鎖降級為讀鎖。 當持有 write lock 且在還沒 unlock 前, 先持有 read lock 然後 unlock write lock 完成從寫鎖切換成讀鎖, 稱之為 downgrading。 downgrading 被 JUC 的 ReadWriteLock 允許, 因為當線程持有 write lock 時, 沒有任何其他線程能持有該 read lock 和 write lock, 所以 downgrading 能確保寫鎖能切換成讀鎖。
+
+在某些場景, 我們在修改數據後, 要使用這個數據一段時間, 不希望一修改完後馬上有線程修改這個數據, 此時就會需要 downgrading。 具體範例如下:
+#+begin_src java
+public class CacheData {
+    Object data;
+    volatile boolean cachedValid;
+    final ReadWriteLock rwlock = new ReentrantReadWriteLock();
+    final Lock rlock = rwlock.readLock();
+    final Lock wlock = rwlock.writeLock();
+
+    public void updateCacheDataAndUse () {
+        rlock.lock();
+        // cachedValid = false 代表 cache data 要被更新
+        if (!cachedValid) {
+            // read lock 沒有 unlock 前, 不能直接 upgrading 成 write lock
+            rlock.unlock();
+            wlock.lock();
+            try {
+                // cachedValid 需要再次檢查, 避免狀態已經改變
+                if (!cachedValid) {
+                    data = ...;
+                    // data 已經更新, cachedValid 改為 true
+                    cachedValid = true;
+                }
+
+                // downgrading to read lock
+                rlock.lock();
+            } finally {
+                wlock.unlock();
+            }
+        }
+
+        try {
+            // use data
+            use(data);
+        } finally {
+            rlock.unlock();
+        }
+    }
+}
+#+end_src
+** ReadWriteLock 的弊端
+ * 寫入線程飢餓
+   ReadWriteLock 在讀多寫少的場景且採不公平調度下, 由於獲得 write lock 必須等待所有其他線程釋放鎖, 所以有可能導致對數據修改的線程一直無法成功執行。
+ * 不支持 upgrading
+   由於 read lock 切換成 write lock 要等待其他線程釋放所有的鎖, 如果兩個線程同時 upgrading 會倒置死鎖。
+
+* StampedLock
+StampedLock 在 JDK 1.8 被引入, 是 ReadWriteLock 的改進, 它將 read 的場景加以細分成樂觀讀和悲觀讀, 在只有 read 的場景下採用 nolock 技術, 只有在有發生過 write 時, 才會採用悲觀讀的方式上 read lock, 更進一步提昇 read write lock 的併發性。
+StampedLock 的三種模式如下:
+1. optimistic read lock: 與 ReadWriteLock 的 read lock 相似
+2. pessimistic read lock: 相當於直接操作數據, 沒有上鎖
+3. write lock: 與 ReadWriteLock 的 write lock 相似, 但只和 pessimistic read lock 互斥, 和 optimistic read lock 不互斥, 所以當獲得 write lock 並更新數據後, 以 optimistic lock 讀取的數據會成為髒數據。
+
+** StampedLock vs ReadWriteLock
+StampedLock 沒有 implements ReadWriteLock, 有自己一套方法主要原因是兩種讀寫鎖的差異很大, 主要體現在:
+1. 方法簽名和返回類型
+   ReadWriteLock 返回並操控 Lock 對象, 而 StampedLock 返回並操控 long stamp, 當 stamp = 0 時表示上鎖成功, 其餘表示失敗
+2. 是否支持 Condition
+   由於 ReadWriteLock 操作的對象是 Lock, 所以支持 Condition; 但 StampedLock 操作的是 long, 不支持 Condition
+3. 是否支持重入
+   StampedLock 是 non-reentrant lock, 因為當相同的 thread 重入 write lock 可能會造成死鎖
+4. 是否支持 upgrading
+   由於 StampedLock 在樂觀讀模式下是 nolock 的, 所以支持將 read lock 切換成 write lock 完成 upgrading
+
+
+| 主要差異           | StampedLock | ReentrantReadWriteLock |
+|--------------------+-------------+------------------------|
+| 方法簽名和返回類型 | long        | Lock                   |
+| Condition          | 不支持      | 支持                   |
+| 重入               | 不支持      | 支持                   |
+| upgrading          | 支持        | 不支持                 |
+
+** StampedLock 基本使用
+StampedLock 依賴 long 類型的 stamp:
+ * pessimistic read lock/ unlock
+   #+begin_src java
+    public long readLock();
+    public void unlockRead(long stamp);
+   #+end_src
+ * write lock/ unlock
+   #+begin_src java
+    public long writeLock();
+    public void unlockWrite(long stamp);
+   #+end_src
+ * try optimistic read lock
+   #+begin_src java
+    public long tryOptimisticRead();
+   #+end_src
+ * validate optimistic read stamp
+   #+begin_src java
+    public boolean validate(long stamp);
+   #+end_src
+
+使用 StampedLock 完成緩存按須加載:
+1. get 時先以 optimistic 方式從 cache 讀取數據
+2. optimistic 方式 read 成功時, 要確認是否數據為髒數據, 如果為髒數據要採用 pessimistic read 讀取
+3. optimistic 方式失敗時, 採用 pessimistic 方式從 cache 讀取數據, 要上 read lock
+4. cache miss 時, 先上 write lock 做 double check, 再次確認 cache miss 後從 database 加載數據並 update cache
+
+#+begin_src java
+abstract public class StampedLockLazyLoadCache <K,V> {
+    final StampedLock stampedLock = new StampedLock();
+    final Map<K,V> cache = new HashMap<>();
+
+    V get(K key) {
+        V val;
+        long rstamp;
+        long wstamp;
+        // try optimistic read
+        // nolock
+        rstamp = stampedLock.tryOptimisticRead();
+        if (rstamp != 0) {
+            val = cache.get(key);
+            if (val != null) {
+                // validate cache data
+                if (!stampedLock.validate(rstamp)) {
+                    // cache data is dirty
+                    // pessmistic read cache or load from database
+                    val = pessmisticReadCacheOrLoadFromDatabase(key);
+                }
+                return val;
+            }
+            // cache miss
+            // lock write lock
+            wstamp = stampedLock.writeLock();
+            try {
+                // double check
+                val = cache.get(key);
+                if (val != null)
+                    return val;
+                // cache miss
+                // load from database
+                val = loadFromDatabase(key);
+
+                // update cache
+                cache.put(key, val);
+                return val;
+            } finally {
+                stampedLock.unlockWrite(wstamp);
+            }
+        }
+        return pessmisticReadCacheOrLoadFromDatabase(key);
+    }
+
+    V pessmisticReadCacheOrLoadFromDatabase(K key) {
+        V val;
+        long rstamp = stampedLock.readLock();
+        try {
+            val = cache.get(key);
+            if (val != null)
+                return val;
+            // cache miss
+            // lock write lock
+            long wstamp = stampedLock.writeLock();
+            try {
+                // double check
+                val = cache.get(key);
+                if (val != null)
+                    return val;
+
+                // cache miss
+                // load from database
+                val = loadFromDatabase(key);
+
+                // update cache
+                cache.put(key, val);
+                return val;
+            } finally {
+                stampedLock.unlock(wstamp);
+            }
+        } finally {
+            stampedLock.unlockRead(rstamp);
+        }
+    }
+    abstract V loadFromDatabase(K key);
+}
+#+end_src
