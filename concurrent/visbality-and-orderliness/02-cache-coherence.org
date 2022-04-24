@@ -12,7 +12,7 @@ Write-Back 回寫模式下, 先對數據進行寫入的 core, 會通知其他 co
 2. C1 先對 x 的值進行修改, C1 通知 C2 x 的值已經失效
 3. C2 的高速緩存中沒有 x, 從 C1 的高速緩存中讀取 x, C2 完成更新後 Write-Back 到主內存, x 被標記為共享態
 * MESI 緩存行數據的四種狀態
-MESI 協議是 MSI 協議的擴展, 是一種寫入失效協議。 MESI 分別是 *Cache Line 緩存行* 的四種狀態: Modified, Exclusive, Shred, Invalid, 可以用 2 bits 表示。 注意, MESI 狀態是緩存行數據的狀態, 因此不同 core 的高速緩存可能處在不同的狀態。
+MESI 協議是 MSI 協議的擴展, 是一種寫入失效協議。 MESI 分別是 *Cache Line 緩存行* 的四種狀態: Modified, Exclusive, Shared, Invalid, 可以用 2 bits 表示。 注意, MESI 狀態是緩存行數據的狀態, 因此不同 core 的高速緩存可能處在不同的狀態。
 ** M Modified
 該緩存行的數據只在一個 CPU core 的緩存中有複本, 且數據是 Dirty 的。 該緩存數據要在未來某一時間點 (其他 core 訪問主內存的該行數據前), *Write-Back 回寫* 到主內存。 *Write-Back 回寫* 到主內存後, 該緩存行的狀態會變為 E Exclusive 狀態。
 ** E Exclusive

@@ -1,9 +1,9 @@
-#+TITLE: 線程池同步工具
-這裡的 *線程同步* 指的是, 某個指定的線程等待指定的其他一個或多個異步任務結束後, 蒐集異步執行的結果, 實際上就是 join 要做的工作。 但是 join 方法同步線程有其侷限性, 我們要以線程A join 線程 B 執行的結果, 我們必須侵入 A 的代碼中, 主動的寫下 B.join(), 這有兩個問題:
+#+TITLE: 線程同步工具
+這裡的 *線程同步* 指的是, 某個指定的線程等待指定的其他一個或多個線程執行異步任務結束後, 同步異步任務執行的結果。 實際上就是 join 要做的工作。 但是 join 方法同步線程有其侷限性, 我們要以線程A join 線程 B 執行的結果, 我們必須侵入 A 的代碼中, 主動的寫下 B.join(), 這樣會有兩個問題:
 1. 我們必須侵入 A 的代碼
 2. 我們要明確的知道異步任務是執行在哪個線程 B 上
 
-這兩個問題對於我們希望能夠將執行與業務邏輯分離的理念是相背的: 等待並蒐集異步任務的代碼和具體的異步任務應該能跑在任意的線程上, 線程的份配與調度應該與代碼本身分離。 因此, JUC 提供了多種線程同步工具: Semaphore, CountDownLatch, CyclicBarrier 等。 這三種同步工具都包含計數器的功能, 其中 Semaphore 能實現與 Monitor 等價的線程間通信功能, 並且它能夠作到細緻的流量控制, 在共享鎖的篇幅我們有詳細討論, 這裡會聚焦在 CountDownLatch, CyclicBarrier 這兩個工具的使用上。
+這兩個問題對於我們希望能夠將線程資源的維護與業務邏輯分離的理念是相背的: 等待並同步異步任務的代碼和具體的異步任務應該能跑在任意的線程上, 線程的份配與調度應該與業務代碼本身分離。 而 JUC 主要提供了三種線程同步工具: Semaphore, CountDownLatch, CyclicBarrier 等, 這三種同步工具都包含計數器的功能。 其中 Semaphore 能實現與 Monitor 等價的線程間通信功能, 並且它能夠作到細緻的流量控制, 在共享鎖的篇幅我們有詳細討論, 這裡會聚焦在 CountDownLatch, CyclicBarrier 這兩個工具的使用上。
 
 我們假設有一個版本管理工具, 能將 local 的版本和 remote 的版本進行同步, 並有以下需求:
 1. 取得 local 版本
@@ -65,7 +65,7 @@ public void checkVersionAndLogDiff() {
 這樣我們可以使得 get 版本是併發執行的, 此方法對資源的使用關係如下:
 [[https://static001.geekbang.org/resource/image/a5/3b/a563c39ece918578ad2ff33ab5f3743b.png]]
 * 使用 CountDownLatch 同步
-使用 join 來同步線程的問題在於, join 無法跟 thread pool 一起工作, 因為 join() 必須要指名針對要操作的線程, 但是當我們使用 thread pool 時, thread 的分配與調度被 thread pool 封裝了, 因此我們需要維護一個計數器來作到同步, 而 CountDownLatch 就是用於解決這個問題, 它的解決思路如下:
+使用 join 來同步線程的問題在於, join 無法跟 thread pool 一起工作, 因為調用 join() 必須要知道指名針對要同步的線程, 但是當使用 thread pool 時 thread 的分配與調度是被封裝了, 因此我們只能維護一個計數器來作到同步, 而 CountDownLatch 就是用於解決這個問題, 它的解決思路如下:
 1. 準備一個 CountDownLatch latch = new CountDownLatch(int count)
 2. 當主線程調用 latch.await() 時, 阻塞等待到 latch 內部的 count 為 0
 3. 只有在 *異步任務執行結束時* 主動調用 latch.countDown(), 這一步非常容易放錯位置導致線程同步出錯
@@ -102,9 +102,9 @@ public void checkVersionAndLogDiff() {
 }
 #+end_src
 * 使用 CyclicBarrier 同步
-CyclicBarrier 想要做的事情是, 當計數器 = 0 時, 主動觸發事先定義好的 callback function, 也就是說我們可以將同步後要做什麼的邏輯實現在 callback function 裡, 只要 CyclicBarrier 的計數器歸零自動觸發 callback 執行。
+CyclicBarrier 想要做的事情是, 當計數器 = 0 時, 主動觸發事先定義好的 callback function, 也就是說我們可以將同步後要做什麼的邏輯實現在 callback function 裡, 只要 CyclicBarrier 的計數器歸零自動觸發 callback 執行, 執行完 callback 後會自動重置計數器, 完成一個同步循環。 而執行 callback 的線程在默認情況下是最後一個要同步的任務執行完的線程, 但也可以分配獨立的線程去執行 callback; 如果 callback 與其他異步任務是獨立的, 這樣的設計可以不用等待 callback 任務執行完才執行新的一輪循環。
 
-基於上一個方案, 如果  diff 和 logDiff 這兩個方法如果要等待很久, 一樣有可能造成性能瓶頸, 但實際上這兩個方法與 get version 的方法是完全獨立的, 因此我們希望能夠進一步提高性能:
+基於上一個方案, 如果  diff 和 logDiff 這兩個方法如果要等待很久, 一樣有可能成為性能瓶頸, 而實際上這兩個方法與 get version 的方法是完全獨立的, 因此我們希望能夠進一步提高性能:
 [[https://static001.geekbang.org/resource/image/e6/8b/e663d90f49d9666e618ac1370ccca58b.png]]
 
 這時候, 我們可以考慮這樣實現:
@@ -146,7 +146,7 @@ public void checkVersionAndLogDiff() {
 #+end_src
 這樣當執行 latch.await() 時, 主線程會被阻塞到所有 get version 任務結束, 然後馬上在另一個線程執行 diff 和 logDiff 的工作, 並且這個線程可以和下一次的 get version 異步執行。
 
-如果利用 CyclicBarrier 需要傳入一個 Runnable 的方法, 它會在計數器為 0 時調用, 這樣就可以作到異步執行, 並且計數器 -1 的方法是 await, 意思是要執行的方法要 await 該方法執行結束:
+如果利用 CyclicBarrier 需要傳入一個 Runnable 的方法, 它會作為我們提到的 callback 任務並在計數器為 0 時被調用, 而當線程開始執行待同步的異步任務時, 我們稱之為線程進入了 barrier, 在離開 barrier 的位置我們要主動聲明 cyclicBarrier.await(), 意思是 callback 要 await 該方法執行結束, 執行 await 後計數器會 -1, 直到計數器為零觸發 callback:
 #+begin_src java
 static ExecutorService pool = Executors.newCachedThreadPool();
 
@@ -175,12 +175,12 @@ public void checkVersionAndLogDiff() {
         });
 }
 #+end_src
-注意, 我們這裡使用了 newCachedThreadPool, 它會為每個任務啟新的線程, 這是為了讓 callback function 執行時啟用獨立的線程, 因為 CyclicBarrier 會默認讓最後一個進入 barrier 的線程執行完後執行 callback, 這樣會造成 T1, T2 執行完後, 由最後一個執行完的線程執行 callback function, 導致性能又會回到上一個版本, 因此在設計時要仔細確認 callback 是工作在獨立的線程上。
+注意, 我們這裡使用了 newCachedThreadPool, 它會為每個任務啟新的線程, 這是為了讓 callback function 執行時啟用獨立的線程, 這是因為前面提到過 *CyclicBarrier 會默認讓最後一個進入 barrier 的線程執行完待同步的異步任務之後執行 callback*, 這樣會造成 T1, T2 執行完後, 由最後一個執行完的線程執行 callback, 如果使用固定線程數量的 thread pool 會導致執行 callback 的過程並不是異步的, 性能又會回到上一個版本, 因此在設計時 *要仔細確認 callback 是工作在獨立的線程上* 。
 
 另外, 當 CyclicBarrier 的計數器為 0 時, 會自動 reset 計數器, 作到 CyclicBarrier 的復用; 考慮到這個功能, 我們可以將 CyclicBarrier 提升為共享資源, 以作到資源的最大利用, 為這個設計我們調整一下整體實現思路:
 1. local version 放在共享 local 隊列
 2. remote version 放在共享 remote 隊列
-3. 比對版本時, 從兩個隊列中取 1 個出來比對
+3. 比對版本時, 從兩個隊列中分別取 1 個出來比對
 4. 我們要求確認版本必須是與其他方法異步, 與自己同步阻塞的, 因此我們分配獨立的 SingleThreadExecutor 線程池給它
 #+begin_src java
 public class VersionControl {
@@ -215,10 +215,10 @@ public class VersionControl {
 }
 #+end_src
 
-注意, 我們給 cyclicBarrier 的 callback function 分配的是獨立的 single thread pool, 這裡有兩個理由:
+注意, 我們給 cyclicBarrier 的 callback 分配的是獨立的 single thread pool, 這裡有兩個理由:
 1. 線程安全考量
-   在 checkVersion 裡面我們有對兩個隊列進行修改, 多線程執行 checkVersion 有可能會產生數據不一致的問題
+   在 checkVersion 裡面我們有對兩個隊列進行修改, 而它本身不是線程安全的, 之前之所以沒有安全問題是由於 callback 每一輪等待兩個異步任務結束後才執行; 而我們在這裡如果 callback 任務互相不阻塞、可異步執行的, 就有可能會導致兩個隊列的數據不同步
 2. 性能考量
-   我們必須讓這個 callback function 的 thread pool 獨立於 get version 的 pool, 否則 get version 的 pool 線程用完時, 一樣會阻塞 callback function 的 pool
+   我們必須讓這個 callback function 的 thread pool 獨立於 get version 的 pool, 否則 get version 的 pool 線程用完時, 一樣會阻塞 callback 的 thread
 
-CyclicBarrier 有個缺點是, 它有可能會使代碼的內聚性降低, 這點要注意。
+CyclicBarrier 有個缺點是, 它有可能會使代碼的內聚性降低, 這點需要注意。
