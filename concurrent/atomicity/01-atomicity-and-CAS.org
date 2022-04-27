@@ -1,61 +1,62 @@
 #+TITLE: 原子性問題與 Compare-And-Swap
-* Atomicity
-我們可以從一個例子出發, 來理解原子性的問題:
+* 原子性問題的根源
+一個 CPU 指令在執行過程中, 如果不會發生線程切換, 這樣的操作我們稱之為原子操作。 這種原子性質能保證在多線程併發下的數據一致性問題, 但是高層語言的一個簡單操作, 可能會對應到多條 CPU 指令, 即便假設這些 CPU 指令都是原子的, 但是每個原子操作之間可能發生線程切換, 導致數據最終是不一致的。 而有些高層語言的操作在高級語言的層面已經無法再分割, 這導致很多在高層語言的操作容易被誤會成原子的, 比如經典的 i++:
 #+begin_src java
-public class AtomicityDemo {
-    private static class SyncedIncrement {
-        volatile int value = 0;
-
-        public synchronized int get() {
-            return value;
-        }
-        public synchronized void set(int i) {
-            value = i;
-        }
-        public synchronized void add(int i) {
-            set(get() + i);
-        }
-    }
-
-    final static ExecutorService pool = Executors.newFixedThreadPool(10);
-    public static void main(String[] args) {
-        CountDownLatch latch = new CountDownLatch(1000);
-        SyncedIncrement demo = new SyncedIncrement();
-        for (int i = 0; i < 1000; i++) {
-            pool.submit(() -> {demo.add(1);});
-            latch.countDown();
-        }
-        pool.shutdown();
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-        System.out.println("result: " + demo.get());
+public class SelfPlusDemo {
+    int i;
+    public void selfPlus() {
+        i++;
     }
 }
-
 #+end_src
-輸出結果為:
-result: 686
+i++ 這個操作, 在 Java 語言層是無法在分割的, 但是對應到 CPU 指令至少有三個操作:
+1. 從內存把 i 的值加載到寄存器
+2. 在寄存器完成 i + 1 操作
+3. 將寄存器的結果寫回內存
+這三個操作都是原子操作, 這三個操作完成之前可能能發生線程切換:
+[[https://static001.geekbang.org/resource/image/33/63/33777c468872cb9a99b3cdc1ff597063.png]]
+在線程 A 執行到第一步時, 如果發生了線程切換, 線程 B 此時看到 i 的值依然是 0, 這導致了最終的結果為 i = 1, 這與我們期望的 i = 2 是不一致的。
+* 確保原子性的技術
+** 互斥鎖技術
+如果原子性問題的根源是 *對臨界資源的存取過程中, 發生線程切換*, 那麼 *要保證原子性最簡單直接的方式, 就是確保線程在臨界區內不發生線程切換* 能做到這一點的技術實際上包含所有互斥鎖性質的技術:
+Java 隱式鎖, JUC 的 ReentrantLock 等都能做到。 其想法就是當有線程進入臨界區對臨界資源做數據修改時, 阻止其他線程進入臨界區, 這樣就確保了操作的原子性。以下是 Java 隱式鎖的例子:
+#+begin_src java
+public class SelfPlusDemo {
+    int i;
+    public synchronized void selfPlus() {
+        i++;
+    }
+}
+#+end_src
+** Compare-And-Swap 技術
+大多數互斥鎖技術都會使線程發生阻塞, 而所有的線程阻塞-喚醒的技術, 在底層都是透過 OS 的 mutex_lock 實現的, 這是一種 system call, 會引發用戶態/內核態的切換, 因此開銷大、性能低。 除了互斥鎖技術之外, 還有另一種解決方案, 就是調用硬件層開放給高層語言的具備原子操作完成數據修改的 API, 這種 API 就是 Compare-And-Swap (CAS)。 這種技術的特點是, 當線成要嘗試修改臨界資源時, 先確認數據是不是自己期望的值, 如果與自己期望相符, 代表當前我的期望與目前的數據狀態一致, 我可以對數據進行修改; 反之則代表數據狀態已經發生改變, 我無權對數據進行操作, 這就是經典的 *比較-並交換* 技術。 CAS 的優勢在於, 當自己無法進入臨界區時, 不會像互斥鎖一樣被阻塞, 而可以重新以 CAS 的方式嘗試對數據做修改, 這就是 CAS 自旋。 由於不阻塞線程, CAS 操作不發生用戶態/內核態的切換, 這種不阻塞、無鎖的技術被廣泛應用在各種併發工具中, 比如 Java 隱式鎖的輕量級鎖、JUC 的 Atomic 類。 以下是以 CAS 自旋技術確保原子性的示例:
+假如現在某個對象的屬性在內存中的值為 100, 此時有兩個線程 A, B 分別使用 CAS 嘗試對其進行更新, 其中 A 線程要將該值更新為 200, B 則希望更新成 300:
+[[./image/cas-01.png]]
+由於 CAS 是原子操作, 因此 A 和 B 只有一個會成功執行, 我們假設 A 執行成功, 此時內存中的值會被更新成 200, 而 B CAS 失敗, 因此 B 只能自旋, 開始新的一輪循環, 這一輪循環會將 expected 的值改為 200, 然後進行 CAS(200, 300) 操作, 這次 B 的 CAS 操作會成功。
 
-SyncedIncrement 所有的方法都是 synchronized 的, 並且我們操作的 value 對象, 是以 volatile 修飾, 我們期望 pool.submit(() -> {demo.add(1);}); 時, 這個操作是線程安全的, 但是這樣的操作卻是線程不安全的, 原因在於: 由於線程僅有 10 個, 確有 1000 個 task, 這樣會使得 set(get() + i); 發生線程切換, 從而破壞了原子性。 原子性的保障, 必須透過 CAS 操作完成, 僅透過隱式鎖與 volatile 是不夠的。
+* Compare-And-Swap 技術原理
+CAS 是硬件層開放給高級語言的 API, 它的想法是:
+1. 告知 CPU 要對記憶體中哪一個位址的數據進行 CAS 操作, 以及告知我當前操作要依賴的數據狀態, 以及打算要將數據更新成什麼狀態
+2. CPU 會原子的方式比較我依賴的數據狀態與當前數據狀態是否相同
+3. 如果比較結果相同則直接對數據進行覆蓋並 return true 告知 CAS 操作成功; 不同則直接 return false 告知 CAS 操作失敗
 
-* Compare-And-Swap (CAS)
-由於重量級鎖是透過 OS 的 mutex_lock 實現的, 這是一種 system call, 會引發用戶態/內核態的切換, 因此開銷大、性能低。 而輕量級鎖是使用 Compare-and-Swap CAS 的方式自旋搶鎖, 這個過程是 CPU 指令級別的原子操作, 過程中不發生用戶態/內核態的切換, 因此開銷很低。 CAS 是一種無鎖的算法:
-1. 透過 Object 的 offset 得到要 CAS 操作的 attribute 在內存中的值 (Compare)
-2. 比較期望的值和內存中的值是否相等, 相等代表之前沒有其他人操作過, 可以對其進行賦值 (Swap)
+所以, CAS 操作包含幾個要素:
+1. 記憶體位址, 表示要對哪一個記憶體位址的數據操作
+2. 期望值, 表示我當前的操作要依賴的數據狀態
+3. 更新值, 表示我打算將數據更新成什麼狀態
+** Java 中的 CAS API 與 Unsafe 類
+我們有一個很具體的問題, 就是我們實際上是在高級語言層調用 CAS API, 而高級語言層對數據在記憶體中的存放方式有自己一套精緻巧妙的機制, 因此高級語言層必須自己提供 Object 或原生數據對象的記憶體位址計算方式, 以及完成和底層 CAS API 的轉接。 另外 CAS API 實際上是一條 CPU 指令級別的原子指令, 比如 *cmpxchg* 。 不同的 CPU 與作業系統對 CAS API 的實現也不相同。 在 Java 生態圈中則更複雜一些, 每一種 JVM 實現的這個精巧的機制都不大相同, 因此實際上在 Java 語言中的 CAS API 被封裝在一個叫 Unsafe 的類中, 這些方法大多都是 native 的方法, 由我們依賴的 JVM 提供, 而我們實際上使用的 CAS API 被封裝在 JUC 的 Atomic 類裡, 這些類有安全的 CAS 實現。
 
-** Unsafe 類
 Unsafe 是 sun.misc 底下的一個類, 提供一些 low level 且 unsafe 的操作, 如直接訪問系統資源、自主管理內存資源等。 Unsafe 的方法大多都是 native 的方法, 基於 C++ 實現, 這些方法在提昇 Java 運行效率、增強底層資源操作能力上起到很大的作用, 但這些方法是不安全的, 開發中沒有特別的理由不應該使用 Unsafe 提供的方法。
 
-OS 層面的 CAS 是一條 CPU 指令級別的原子指令 *cmpxchg*, 由於 *cmpxchg* 具備 CPU 指令級別的原子性, 因此對數據操作時不會有數據不一致的問題, 避免了線程安全中的原子性問題。 Unsafe 提供的 CAS 方法是直接以 native 的方式用 C++ 封裝, 調用了底層的 *cmpxchg* 。
+在 Java 語言層, 我們獲得數據的記憶體位址有以下方式:
+1. 對於 primitive 類型, 直接傳入 reff
+1. Object + 成員變量的 offest, 可以獲得該成員變量的位址
 
 完成 Java 應用層的 CAS 操作主要有以下步驟:
 1. 取得 Unsafe instance
-2. 調用 Unsafe 的 CAS 方法
-3. 調用 Unsafe 的 attribute 偏移量方法, 這些方法用於獲取 attribute 偏移量, 這些偏移量要提供給 CAS 方法作為參數
-
+2. 調用 Unsafe 封裝的用於計算記憶體位址偏移量的方法, 這些偏移量要提供給 CAS 方法作為參數
+3. 調用 Unsafe 封裝的 CAS 方法
 *** 取得 Unsafe instance
 Unsafe 是一個 final 類, 是無法被繼承的, 而他的 constructor 也是 private 的, 如果要取得 Unsafe Object 要使用 reflection:
 
@@ -92,6 +93,12 @@ public class UnsafeDemo {
     }
 }
 #+end_src
+*** 調用 Unsafe 的 attribute 偏移量方法
+#+begin_src java
+    public native long staticFieldOffset(Field field);
+
+    public native long objectFieldOffset(Field field);
+#+end_src
 *** 調用 Unsafe 的 CAS 方法
 Unsafe 類的方法依賴下列四個參數:
  * o 需要操作的 attribute 所在的對象
@@ -108,16 +115,4 @@ Unsafe 提供了 3 種 CAS 操作:
 
     public final native boolean compareAndSwapLong(Object o, long offest, long expected, long update);
 #+end_src
-
 當調用 CAS 方法時, 首先會以內存中的值和 expected 的值做比較, 如果相同就將 update 值覆蓋內存中的值, 並 return true, 否則什麼都不做並返回 false, 表示 CAS 操作失敗
-
-*** 調用 Unsafe 的 attribute 偏移量方法
-#+begin_src java
-    public native long staticFieldOffset(Field field);
-
-    public native long objectFieldOffset(Field field);
-#+end_src
-** CAS 自旋示意
-假如現在某個對象的屬性在內存中的值為 100, 此時有兩個線程 A, B 分別使用 CAS 嘗試對其進行更新, 其中 A 線程要將該值更新為 200, B 則希望更新成 300:
-[[./image/cas-01.png]]
-由於 CAS 是原子操作, 因此 A 和 B 只有一個會成功執行, 我們假設 A 執行成功, 此時內存中的值會被更新成 200, 而 B CAS 失敗, 因此 B 只能自旋, 開始新的一輪循環, 這一輪循環會將 expected 的值改為 200, 然後進行 CAS(200, 300) 操作, 這次 B 的 CAS 操作會成功。

@@ -1,5 +1,13 @@
 #+TITLE: 提昇高併發場景下 CAS 的性能
-在激烈競爭的高併發場景下使用 CAS 可能會導致空自旋, 比如在大量線程同時併發修改一個 AtomicInteger 時, 可能有很多線程會不停自旋, 甚至有些線程會進入一個無限循環中, 從而大量佔用 CPU 資源。 另外, 大量 CAS 也可能引發 Bus 風暴, 我們會在後面的章節討論到。
+在 JUC Atomic 章節我們提到, 在多線程併發環境下, 如果臨界區滿足以下條件, 不建議採用 synchronized 來解決, 而是建議優先使用 JUC 原子類:
+1. 臨界區執行時間很短
+2. 對臨界資源讀多寫少的場景
+
+這場景之所以適用, 其背後的邏輯有兩個:
+1. 臨界區執行時間短, 比起 CAS 自旋一下, 阻塞-喚醒的成本更高
+2. 對臨界資源 read 的操作不會對數據狀態做出改變, 說明 CAS 在大多數情況下是成功的
+
+對臨界資源寫多讀少的場景, 雖然可能 Atomic 的性能還是會因為臨界區執行時間短而優於使用 *阻塞-喚醒* 方案, 但會導致大多數線程佔用 CPU 並嘗試 CAS 並失敗, 從而佔用大量 CPU 資源。另外, 大量 CAS 也可能引發 Bus 風暴, 我們會在後面的章節討論到。 對於寫多讀少的場景, 我們可以考慮使用 Adder 和 Accumulator 來進一步提昇性能。
 * 以空間換時間: Adder, Accumulator
 JDK 1.8 以後提供了 *Adder* 和 *Accumulator* 原子類, 包含 LongAdder, DoubleAdder, LongAccumulator, DoubleAccumulator 等, *Adder* 和 *Accumulator* 兩者的區別在於 *Accumulator* 可以接收一個函數。 *Adder* 和 *Accumulator* 的原理是熱點分離, 與 ConcurrentHashMap 的思想類似: 將 value 值分離成一個 Array, 當多線程訪問時, 透過 Hashing 將線程映射到 Array 的一個元素進行操作, 而最終需要獲取加總的 value 時, 則將整個 Array 的元素求和。
 
