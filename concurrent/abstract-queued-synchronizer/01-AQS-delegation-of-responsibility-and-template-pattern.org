@@ -1,0 +1,136 @@
+#+TITLE: AQS 職責劃分與模板模式
+* AQS 的價值
+在併發場景中, 我們是透過 *互斥性* 來保證線程安全的, 能做到的技術有兩種:
+1. *阻塞-喚醒*
+   但 *阻塞-喚醒* 會觸發進程的工作狀態在用戶態與內核態之間切換, 過程中需要傳遞大量的上下文訊息確保狀態切換後程序能正常執行
+2. *CAS 自旋*
+   由於 *CAS 自旋* 不阻塞 CPU, 大量的 CAS 空自旋會使 CPU 使用率飆升, 並且會因為 CAS 操作、緩存失效的通知產生緩存一致性流量, 會佔用大量 Bus 資源
+
+選擇只採用其中任何一種是不現實的, 因此更好的方案是能夠在這兩種方案之間權衡的機制: 先採 CAS 自旋的方案, 直到 CAS 自旋次數耗盡後, 切換成 *阻塞-喚醒* 的方案。 這也是我們在樂觀鎖的章節我們提到, 樂觀鎖常會與悲觀鎖機制混用, 成為提昇悲觀鎖性能的補充:
+ * Java 隱式鎖的輕量級鎖膨脹為重量級鎖
+ * JUC 的 StampedLock 的樂觀讀/悲觀讀機制
+ * JUC 所有依賴隊列同步技術的工具類
+
+AQS 本質上是一種透過引入隊列來做到在 *CAS 自旋* 與 *阻塞-喚醒* 權衡的技術方案。 JUC 以 AQS 實現的 ReentrantLock 的性能在大多時候可以追平 JDK 1.6 之後的 Java 隱式鎖。 也就是說, AQS 對於 JDK 1.6 以後的 Java 隱式鎖並沒有創造什麼性能奇蹟, 兩種技術方案在解決的是相同的問題, 並且最終收穫了不相上下的性能。 AQS 真正的價值在於其工程實現, 透過採用 template pattern 設計模式, 成為了所有具有同步需求的 JUC 工具類底座。 許多 JUC 顯示鎖都是基於 AQS 構建的, 比如: ReetrantLock, Semaphore, CountDownLatch, ReetrantReadWriteLock, FuterTask 等。
+* AQS 的繼承關係與職責劃分
+*AQS 的繼承關係就相當於是職責劃分, 在這裡充分體現了 single responsibility 原則, 以及 OOP 的職責委派*:
+1. super class
+   負責所有 AQS 類最通用的方法: 只負責提供以 EXCLUSIVE mode 持有 AQS 的 thread 是誰
+2. AQS 自身
+   * 負責提供最基礎的同步隊列維護方法, 以 template pattern 實現
+   * 負責制定對修改關閉的 template method, 以及對 subclass 開放的 hook method, 這些方法構成了最基礎的對同步隊列的維護
+3. AQS 的 concrete class
+   AQS 的 concrete class 分兩種, JUC 工具類和 template hook method 的實現類:
+    * JUC 工具類
+      負責提供面向工具本身的方法, 比如 ReentrantLock 要提供 lock(), unlock(),... 等等
+    * template hook method 的實現類
+      負責針對每一種 JUC 工具類提供 template method 的實現
+** AQS 的 super class
+AbstractQueuedSynchronizer 繼承自 AbstractOwnableSynchronizer, 只有兩個值得注意的點:
+1. 雖然是 abstract class, 但其方法都是 concrete 的, 它抽象的是其 Object 本身
+2. 負責紀錄以 EXCLUSIVE mode 持有 AQS 的 thread, 用於做重入條件的判斷, 這些方法是 protected 且 final 的, subclass 可以調用, 但不能修改。
+#+begin_src java
+public abstract class AbstractOwnableSynchronizer
+    implements java.io.Serializable {
+
+    /** Use serial ID even though all fields transient. */
+    private static final long serialVersionUID = 3737899427754241961L;
+
+    /**
+     * Empty constructor for use by subclasses.
+     */
+    protected AbstractOwnableSynchronizer() { }
+
+    /**
+     * The current owner of exclusive mode synchronization.
+     */
+    private transient Thread exclusiveOwnerThread;
+
+    /**
+     * Sets the thread that currently owns exclusive access.
+     * A {@code null} argument indicates that no thread owns access.
+     * This method does not otherwise impose any synchronization or
+     * {@code volatile} field accesses.
+     * @param thread the owner thread
+     */
+    protected final void setExclusiveOwnerThread(Thread thread) {
+        exclusiveOwnerThread = thread;
+    }
+
+    /**
+     * Returns the thread last set by {@code setExclusiveOwnerThread},
+     * or {@code null} if never set.  This method does not otherwise
+     * impose any synchronization or {@code volatile} field accesses.
+     * @return the owner thread
+     */
+    protected final Thread getExclusiveOwnerThread() {
+        return exclusiveOwnerThread;
+    }
+}
+#+end_src
+** AQS 的 concrete class
+*每一種依賴 AQS 的 JUC 工具類, 其主要的職責是該工具類應對併發場景的職責。* 以 ReentrantLock 為例, ReentrantLock 的職責是實現一個可重入的鎖, 也就是實現 Lock interface 的所有方法; 其次才是完成 AQS 的 template hook method 的實現。 為了遵守 single responsibility, 每一種依賴 AQS 的 JUC 工具類都會在內部實現一個內部靜態類 Sync, 用於封裝 AQS template hook method 的實現。 每個 JUC 的具體工具類會 compose 一個 Sync 對象 sync, 並只面向具體併發場景編程, 當需要涉及同步隊列的操作時, 要麼透過 AQS 的 template method 來操作, 要麼直接委派給 sync 的方法去操作。 這樣的設計除了遵守 single responsibility 原則外, 也隱含了 strategy pattern 的設計, 這樣 JUC 的工具類可以根據不同的策略實現不同的 Sync 子類以應對不同的併發需求, 比如: ReentrantLock 的調度方式可以分為 *不公平調度* 與 *公平調度*, 我們不必為兩種調度方式實現兩個不同的 NonfairReentrantLock 和 FairReentrantLock, 只需要透過 constructor 傳入就好。
+
+以下是直接依賴 AQS 的 JUC 工具類:
+ * ReentrantLock
+   * NonfairSync
+   * FairSync
+ * ReentrantReadWriteLock
+   * NonfairSync
+   * FairSync
+ * Samephore
+   * NonfairSync
+   * FairSync
+ * CountDownLatch
+   * Sync
+ * ThreadPoolExecutor.Work
+   * Sync
+* AQS 的 template pattern
+** template method 的兩種模式
+AQS 的 template method 最宏觀的流程只涉及對 AQS 的獲得/釋放, AQS 的獲得與釋放是會改變 AQS state 的操作, 這種分為兩種模式:
+ * EXCLUSIVE
+ * SHARED
+也就是說, 我們在操作 AQS 的時候, AQS 的 state 會發生改變, 這種 AQS 操作又分為 EXCLUSIVE 或是 SHARED 兩種 mode。
+這些最宏觀的 template method 為:
+ * 以 EXCLUSIVE mode 獲得/釋放 AQS 的 template method
+   #+begin_src java
+   public final void acquire(int arg);
+   public final void acquireInterruptibly(int arg);
+   public final boolean tryAcquireNanos(int arg, long nanosTimeout);
+
+   public final boolean release(int arg);
+   #+end_src
+ * 以 SHARED mode 獲得/釋放 AQS 的 template method:
+   #+begin_src java
+   public final void acquireShared(int arg);
+   public final void acquireSharedInterruptibly(int arg);
+   public final boolean tryAcquireSharedNanos(int arg, long nanosTimeout);
+
+   public final boolean releaseShared(int arg);
+   #+end_src
+
+注意, 所有的 template method 都屬於 template pattern 要保護的 *流程*, 在 AQS 中這些方法都會以 *final* 修飾, 或是乾脆就是 private 的, 以禁止 subclass 對他們就行修改, 這是為了遵守 open-close 原則: 對 template method 的修改必須是關閉的。
+
+這些最宏觀的 template method 內部會調用兩種方法:
+1. 其他的 template method
+   如果允許 subclass 調用, 以 protected 和 final 修飾; 如果不允許, 以 private 修飾
+2. subclass 實現的 hook methods
+** template hook method
+所有的 hook method 都是交給 AQS 的 subclass 來實現, 這些 hook method 都是 protected 的, 表示允許 subclass override, 在 AQS 這一層實現的是 throws UnsupportedOperationException, 也就是說, 這些方法在 subclass 中沒有被 override 且被調用的話會拋出異常。
+hook method:
+#+begin_src java
+protected boolean tryAcquire(int arg) { throw new UnsupportedOperationException(); }
+protected boolean tryRelease(int arg) { throw new UnsupportedOperationException(); }
+
+protected int tryAcquireShared(int arg) { throw new UnsupportedOperationException(); }
+protected boolean tryReleaseShared(int arg) { throw new UnsupportedOperationException(); }
+
+protected boolean isHeldExclusively() { throw new UnsupportedOperationException(); }
+#+end_src
+* AQS 的閱讀順序
+在理解 AQS 的職責劃分後, 閱讀 AQS 的順序應為:
+1. 理解 AQS 維護同步隊列的最基礎的工作流程與內部成員
+   在這個階段只須理解最基礎的工作流程與內部成員, 不須涉及同步隊列的維護, 只須知道維護同步隊列時是依賴哪些內部成員被修改。
+2. 追蹤 template method 的入口
+   AQS 有兩種模式的 template method, EXCLUSIVE 和 SHARED 的。 在閱讀時只鎖定一中一種模式追蹤完整的獲取到釋放流程。
+3. 閱讀完 AQS 核心代碼後, 再去閱讀各個依賴 AQS 實現的工具類
