@@ -1,8 +1,9 @@
 #+TITLE: JUC 原子類
-JUC Atomic 類是使用 Unsafe 類的 CAS API 的安全封裝, 它提供的操作不但是原子的, 也是線程安全的。在多線程併發環境下, 如果臨界區滿足以下條件, 不建議採用 synchronized 來解決, 而是建議優先使用 JUC 原子類:
+JUC Atomic 類對 Unsafe 類的 CAS 方法的安全封裝, 它提供的操作不但是原子的, 也是線程安全的, 因為內部實現都以 volatile 確保可見性與有序性。 在多線程併發環境下, 如果臨界區滿足以下條件, 不建議採用 synchronized 來解決, 而是建議優先使用 JUC 原子類:
 1. 臨界區執行時間很短
-2. 對臨界資源讀多寫少的場景
+2. 臨界區執行時間很短, 且對臨界資源讀多寫少的場景
 
+注意條件二的前提, 當臨界區執行時間很短, 即便是激烈的高併發寫操作, Atomic 類的性能也遠超所有使用到阻塞的互斥鎖技術, 包含: Java 隱式鎖, JUC ReentrantLock 等。
 * Atomic 和 Mutex 性能對比
 Mutex 的方案:
 #+begin_src java
