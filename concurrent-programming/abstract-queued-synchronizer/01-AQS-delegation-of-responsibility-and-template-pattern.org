@@ -69,8 +69,16 @@ public abstract class AbstractOwnableSynchronizer
 }
 #+end_src
 ** AQS 的 concrete class
-*每一種依賴 AQS 的 JUC 工具類, 其主要的職責是該工具類應對併發場景的職責。* 以 ReentrantLock 為例, ReentrantLock 的職責是實現一個可重入的鎖, 也就是實現 Lock interface 的所有方法; 其次才是完成 AQS 的 template hook method 的實現。 為了遵守 single responsibility, 每一種依賴 AQS 的 JUC 工具類都會在內部實現一個內部靜態類 Sync, 用於封裝 AQS template hook method 的實現。 每個 JUC 的具體工具類會 compose 一個 Sync 對象 sync, 並只面向具體併發場景編程, 當需要涉及同步隊列的操作時, 要麼透過 AQS 的 template method 來操作, 要麼直接委派給 sync 的方法去操作。 這樣的設計除了遵守 single responsibility 原則外, 也隱含了 strategy pattern 的設計, 這樣 JUC 的工具類可以根據不同的策略實現不同的 Sync 子類以應對不同的併發需求, 比如: ReentrantLock 的調度方式可以分為 *不公平調度* 與 *公平調度*, 我們不必為兩種調度方式實現兩個不同的 NonfairReentrantLock 和 FairReentrantLock, 只需要透過 constructor 傳入就好。
+要開發一個基於 AQS 的工具類, 要做到兩件事情:
+1. 使用 AQS 完成工具類需要實現的功能
+2. 為該工具類實現具體的 template hook method
+因此, AQS 的 concrete class 分兩種, 一種是依賴 AQS 的 JUC 工具類, 而另一種是用於封裝 AQS template hook method 的實現的 Sync 類。 這些 Sync 都是該併發工具類的內部靜態類, 會被 composite 到工具類中, 有需要時以 delegate 的方式被工具類調用。
 
+這樣的設計遵守了以下設計原則:
+1. single responsibility
+   *每一種依賴 AQS 的 JUC 工具類, 其主要的職責是該工具類應對併發場景的職責。* 以 ReentrantLock 為例, ReentrantLock 的職責是實現一個可重入的鎖, 也就是實現 Lock interface 的所有方法; 其次才是完成 AQS 的 template hook method 的實現。
+2. *inherit the most important features and delegate the rest*
+    對於工具類, the most important features 是工具類自身必須提供的功能, 也是最主要的職責, 而應該如何實現 template hook method 則是次要的。
 以下是直接依賴 AQS 的 JUC 工具類:
  * ReentrantLock
    * NonfairSync
