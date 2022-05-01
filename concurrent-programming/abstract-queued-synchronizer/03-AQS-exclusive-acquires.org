@@ -45,13 +45,13 @@ acquire 自旋過程中, 如果收到 interrupt 信號, 會推遲到成功 tryAc
     }
 #+end_src
 執行順序如下:
-+ [[*tryAcquire(arg)][tryAcquire(arg)]]
-+ [[*addWaiter(mode)][addWaiter(mode)]]
-  + [[*enq(node)][enq(node)]]
-+ [[*acquireQueued(node, arg)][acquireQueued(node, arg)]]
-  + [[*shouldParkAfterFailedAcquire(p, node)][shouldParkAfterFailedAcquire(p, node)]]
-  + [[*parkAndCheckInterrupt()][parkAndCheckInterrupt()]]
-+ [[*selfInterrupt()][selfInterrupt()]]
+- [[*tryAcquire(arg)][tryAcquire(arg)]]
+- [[*addWaiter(mode)][addWaiter(mode)]]
+  - [[*enq(node)][enq(node)]]
+- [[*acquireQueued(node, arg)][acquireQueued(node, arg)]]
+  - [[*shouldParkAfterFailedAcquire(p, node)][shouldParkAfterFailedAcquire(p, node)]]
+  - [[*parkAndCheckInterrupt()][parkAndCheckInterrupt()]]
+- [[*selfInterrupt()][selfInterrupt()]]
 ** tryAcquire(arg)
 #+begin_src java
 protected boolean tryAcquire(int arg) {
