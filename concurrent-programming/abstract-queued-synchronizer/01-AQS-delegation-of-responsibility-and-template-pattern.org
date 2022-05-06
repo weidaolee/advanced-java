@@ -26,9 +26,9 @@ AQS 本質上是一種透過引入隊列來做到在 *CAS 自旋* 與 *阻塞-�
     * template hook method 的實現類
       負責針對每一種 JUC 工具類提供 template method 的實現
 ** AQS 的 super class
-AbstractQueuedSynchronizer 繼承自 AbstractOwnableSynchronizer, 只有兩個值得注意的點:
+=AbstractQueuedSynchronizer= 繼承自 =AbstractOwnableSynchronizer=, 只有兩個值得注意的點:
 1. 雖然是 abstract class, 但其方法都是 concrete 的, 它抽象的是其 Object 本身
-2. 負責紀錄以 EXCLUSIVE mode 持有 AQS 的 thread, 用於做重入條件的判斷, 這些方法是 protected 且 final 的, subclass 可以調用, 但不能修改。
+2. 負責紀錄以 =EXCLUSIVE= 方式持有 AQS 的 thread, 用於做重入條件的判斷, 這些方法是 protected 且 final 的, subclass 可以調用, 但不能修改。
 #+begin_src java
 public abstract class AbstractOwnableSynchronizer
     implements java.io.Serializable {
@@ -72,7 +72,7 @@ public abstract class AbstractOwnableSynchronizer
 要開發一個基於 AQS 的工具類, 要做到兩件事情:
 1. 使用 AQS 完成工具類需要實現的功能
 2. 為該工具類實現具體的 template hook method
-因此, AQS 的 concrete class 分兩種, 一種是依賴 AQS 的 JUC 工具類, 而另一種是用於封裝 AQS template hook method 的實現的 Sync 類。 這些 Sync 都是該併發工具類的內部靜態類, 會被 composite 到工具類中, 有需要時以 delegate 的方式被工具類調用。
+因此, AQS 的 concrete class 分兩種, 一種是依賴 AQS 的 JUC 工具類, 而另一種是用於封裝 AQS template hook method 的實現的 =Sync= 類。 這些 =Sync= 都是該併發工具類的內部靜態類, 會被 composite 到工具類中, 有需要時以 delegate 的方式被工具類調用。
 
 這樣的設計遵守了以下設計原則:
 1. single responsibility
@@ -96,11 +96,11 @@ public abstract class AbstractOwnableSynchronizer
 * AQS 的 template pattern
 ** template method 的兩種模式
 AQS 的 template method 最宏觀的流程只涉及對 AQS 的獲得/釋放, AQS 的獲得與釋放是會改變 AQS state 的操作, 這種分為兩種模式:
- * EXCLUSIVE
- * SHARED
-也就是說, 我們在操作 AQS 的時候, AQS 的 state 會發生改變, 這種 AQS 操作又分為 EXCLUSIVE 或是 SHARED 兩種 mode。
+ * =EXCLUSIVE=
+ * =SHARED=
+也就是說, 我們在操作 AQS 的時候, AQS 的 =state= 會發生改變, 這種 AQS 操作又分為 =EXCLUSIVE= 或是 =SHARED= 兩種 mode。
 這些最宏觀的 template method 為:
- * 以 EXCLUSIVE mode 獲得/釋放 AQS 的 template method
+ * 以 =EXCLUSIVE= mode 獲取/釋放 AQS 的 template method
    #+begin_src java
    public final void acquire(int arg);
    public final void acquireInterruptibly(int arg);
@@ -108,7 +108,7 @@ AQS 的 template method 最宏觀的流程只涉及對 AQS 的獲得/釋放, AQS
 
    public final boolean release(int arg);
    #+end_src
- * 以 SHARED mode 獲得/釋放 AQS 的 template method:
+ * 以 =SHARED= mode 獲取/釋放 AQS 的 template method:
    #+begin_src java
    public final void acquireShared(int arg);
    public final void acquireSharedInterruptibly(int arg);
@@ -124,7 +124,7 @@ AQS 的 template method 最宏觀的流程只涉及對 AQS 的獲得/釋放, AQS
    如果允許 subclass 調用, 以 protected 和 final 修飾; 如果不允許, 以 private 修飾
 2. subclass 實現的 hook methods
 ** template hook method
-所有的 hook method 都是交給 AQS 的 subclass 來實現, 這些 hook method 都是 protected 的, 表示允許 subclass override, 在 AQS 這一層實現的是 throws UnsupportedOperationException, 也就是說, 這些方法在 subclass 中沒有被 override 且被調用的話會拋出異常。
+所有的 hook method 都是交給 AQS 的 subclass 來實現, 這些 hook method 都是 protected 的, 表示允許 subclass override, 在 AQS 這一層實現的是 throws UnsupportedOperationException, 也就是說 這些方法在 subclass 中沒有被 override 且被調用的話會拋出異常。
 hook method:
 #+begin_src java
 protected boolean tryAcquire(int arg) { throw new UnsupportedOperationException(); }

@@ -1,18 +1,18 @@
 #+TITLE: AQS 基礎工作流程與基礎結構
 * AQS 基礎工作流程
-AQS 本質上是一種透過引入隊列來做到在 *CAS 自旋* 與 *阻塞-喚醒* 權衡的技術方案。 當一個線程嘗試對 AQS 操作 (acquire) 時, 首先會以 CAS 的方式對 state 進行修改, 這個嘗試會持續 1 秒。 一秒後如果沒成功, 則該線程需要被 park, 並需要進入同步隊列 wait queue 並等待。 每個進入 wait queue 的線程會被封裝到 AQS 的靜態內部類 Node 的 instance 實例中等待被喚醒。 進出 wait queue 也以 CAS 操作來確保性能與線程安全。
+AQS 本質上是一種透過引入隊列來做到在 *CAS 自旋* 與 *阻塞-喚醒* 權衡的技術方案。 當一個線程嘗試對 AQS 操作時, 首先會以 CAS 的方式對 =state= 進行修改, 這個 CAS 自旋策略由每種工具類各自實現, 不涉及對 wait queue 的維護, 並且要 return true or false 來表示這個由工具類實現的策略是否失敗。 如果工具類實現的自旋策略失敗, 則該線程需要進入同步隊列 wait queue 自旋。 每個需要進入 wait queue 的線程會被封裝到 AQS 的靜態內部類 =Node= 的實例中, 透過 AQS 的 template method 決定在 wait queue 中的自旋策略。
 
-另外, AQS 也包含對 Condition 隊列的維護。 一個在等待 Condition 而被阻塞的線程, 在被封裝成 Node 後直接以單向鏈表的方式排在另一個也在等待相同 Condition 的 Node 之後, 直到排在 wait queue 裡的線程被喚醒後, 整個 Condition 隊列重新進入 wait queue。
+另外, AQS 也包含對 =Condition= 隊列的維護。 一個在等待 =Condition= 而被阻塞的線程, 在被封裝成 =Node= 後直接以 *單向鏈表* 的方式排在另一個也在等待相同 =Condition= 的 =Node= 之後, 直到被喚醒後, 整個 Condition 隊列重新進入 wait queue。
 
 以下是 AQS 的 wait queue 的示意圖:
 [[./image/AQS-queue.png]]
 * AQS 的基礎結構
-在 AQS 中, 這個 wait queue 是一個 LinkedList, 只有 head 和 tail, 並以 Node 構成。 並且 head 和 tail 在一開始都是 null 的, 直到真正有 Thread 需要進入 wait queue 時, 才著手準備。
+在 AQS 中, 這個 wait queue 是一個雙向的 =LinkedList=, 只有 =head= 和 =tail=, 並以 =Node= 構成。 並且 =head= 和 =tail= 在一開始都是 =null= 的, 直到真正有 thread 需要進入 wait queue 時, 才著手準備。
 根據 AQS 基礎工作流程, 核心成員至少有:
-1. long 類型的 state, 用以標示同步隊列的狀態
-2. head 和 tail
-3. 靜態內部類 Node
-4. 靜態內部 ConditionObject
+1. =long= 類型的 =state=, 用以標示同步隊列的狀態
+2. =head= 和 =tail=
+3. 靜態內部類 =Node=
+4. 靜態內部 =ConditionObject=
 ** AQS 同步狀態 state
 #+begin_src java
     private volatile int state;
@@ -59,38 +59,38 @@ private transient volatile Node tail;
     }
 #+end_src
 ** 靜態內部類 Node
-根據 AQS 基礎工作流程, Node 至少需要包含:
- * thread, 指向要進入 wait queue 的線程
- * waitState, 表示當前 Node 處在什麼狀態等待
+根據 AQS 基礎工作流程, =Node= 至少需要包含:
+ * =thread=, 指向要進入 wait queue 的線程
+ * =waitState=, 表示當前 =Node= 處在什麼狀態等待
 
-此外很重要的一點是, 當 Node 在 wait queue 中等待時, Node 才是雙向 FIFO 的 Node; 如果是在 Condition 的 queue 中等待時, 是一個單向的 FIFO 的 Node。 但是 AQS 沒有將兩種 Node 做分別的實現, 因為在 Condition 的隊列中等待的 Node, 如果被喚醒後, 會直接進入 wait queue, 為此沒有必要使用兩種不同結構的 Node。 因此, Node 成員有以下三種指向其他 Node 的 pointer:
- * prev, next
-   指向處於 wait queue 中前後的 Node, 不在 wait queue 中則是 null
- * nextWaiter
-   指向處於 condition wait queue 的下一個 Node, 不在  condition wait queue 中則是 null
+此外很重要的一點是, 當 =Node= 在 wait queue 中等待時, =Node= 才是雙向 FIFO 的 =Node=; 如果是在 =Condition= 的 =queue= 中等待時, 是一個單向的 FIFO 的 =Node=。 但是 AQS 沒有將兩種 =Node= 做分別的實現, 因為在 =Condition= 的隊列中等待的 =Node=, 如果被喚醒後會直接進入 wait queue, 沒有必要使用兩種不同結構的 =Node= 。 因此, =Node= 成員有以下三種指向其他 =Node= 的 pointer:
+ * =prev=, =next=
+   指向處於 wait queue 中前後的 =Node=, 不在 wait queue 中則指向 =null=
+ * =nextWaiter=
+   指向處於 condition wait queue 的下一個 =Node=, 不在  condition wait queue 中則指向 =null=
 
 以下為同步隊列中 wait queue 和 condition wait queue 的關係示意圖:
 [[./image/wait-queue-and-condition-wait-queue.png]]
 
-另外, 我們對 AQS 的操作分兩種 mode, 一種是互斥的方式, 一種是共享的方式, 如果對 AQS 的操作涉及對 wait queue 的操作, Node 也需要知道當前的操作是 EXCLUSIVE 或是 SHARED 的, 因此也要有兩個用於表示 Node 是以哪一種 *waiting mode*:
- * EXCLUSIVE
- * SHARED
+另外, 我們對 AQS 的操作分兩種 =mode=, 一種是 *互斥* 的方式, 一種是 *共享* 的方式, 如果對 AQS 的操作涉及對 wait queue 的操作, =Node= 也需要知道當前的操作是 =EXCLUSIVE= 或是 =SHARED= 的, 因此也要有兩個用於表示 =Node= 是以哪一種 *waiting mode*:
+ * =EXCLUSIVE=
+ * =SHARED=
 
-注意, 如果 Node 處在 wait queue 中, nextWaiter 這個 pointer 是多餘的, AQS 的 Node 利用了這個冗餘性: 當 Node 處在 waiting queue 中時, 以 nextWaiter 紀錄 waiting mode
+注意, 如果 Node 處在 wait queue 中, =nextWaiter= 這個 pointer 是多餘的, AQS 的 =Node= 利用了這個冗餘性: 當 =Node= 處在 waiting queue 中時, 以 =nextWaiter= 紀錄 *waiting mode*
 
 *** thread, prev, next
-thread 相對單純, 就只是一個 volatile 的 variable, 而:
+=thread= 相對單純, 就只是一個 volatile 的 variable, 而:
 #+begin_src java
 volatile Thread thread;
 #+end_src
 
-如果 Node 處在 condition wait queue 中, prev 和 next 是 null:
+如果 =Node= 處在 condition wait queue 中, =prev= 和 =next= 是 =null=:
 #+begin_src java
 volatile Node prev;
 volatile Node next;
 #+end_src
 *** waitState
-waitState 分為 5 種, 他們都是 static 的常量:
+=waitState= 分為 5 種, 他們都是 static 的常量:
 #+begin_src java
 volatile int waitStatus; // default to 0
 
@@ -109,22 +109,22 @@ static final int CONDITION = -2;
  */
 static final int PROPAGATE = -3;
 #+end_src
- * CANCELLED = 1
-   這個狀態表示自己的 Thread 由於 timeout 或是被 interrupt, 要切換成 RUNNABLE 狀態做相應的處裡, 並且這種處裡是一種異常處裡, 是與臨界區無關的, 因此處於 CANCELLED 的 Node 不會參與資源競爭, 並且會一直維持這個狀態直到被釋放。
+ * =CANCELLED = 1=
+   這個狀態表示 thread 由於 timeout 或是被 interrupt, 要切換成 =RUNNABLE= 狀態做相應的處裡, 並且這種處裡是一種異常處裡, 是與臨界區無關的, 因此處於 =CANCELLED= 的 =Node= 不會參與資源競爭, 並且會一直維持這個狀態直到被釋放。
    /This node is cancelled due to timeout or interrupt. Nodes never leave this state. In particular, a thread with cancelled node never again blocks./
 
- * SIGNAL = -1
-   這個狀態表示自己的 next Node 已經被 park, 當前 Node 被釋放時需要 unpark next Node。
+ * =SIGNAL = -1=
+   這個狀態表示自己的 =next= 已經被 park, 當前 =Node= 被釋放時需要 unpark =next=
 
- * CONDITION = -2
-   這個狀態表示自己處在 Condition 等待隊列中被阻塞, 當持有鎖的線程調用了 Condition 的 signal() 時, 該 Node 會被轉移到同步隊列。
+ * =CONDITION = -2=
+   這個狀態表示自己處在 =Condition= 等待隊列中被阻塞, 當持有鎖的線程調用了 =Condition= 的 =signal()= 時, 該 =Node= 會被轉移到同步隊列
 
- * PROPAGATE = -3
-   表示自己的下一個 Node 嘗試以 SHARED 的方式 acquire 時, waitState 狀態會被無條件傳播下去。 因為共享鎖的讀取是不互斥的, 因此當一個嘗試獲取共享鎖而被阻塞的 Node 被喚醒時, 也需要喚醒其他後續的 Node。
+ * =PROPAGATE = -3=
+   表示自己的下一個 =next= 嘗試以 =SHARED= 的方式 acquire 時, =waitState= 狀態要無條件傳播下去。 這個 =waitState= 用於以 =SHARED= mode 操作 AQS 的 wait queue 維護
 *** nextWaiter
-nextWaiter 有兩種情況會使用到:
-1. 該 Node 處於一個條件等待隊列上, 這個 nextNode 指向下一個條件等待隊列中的下一個 Node
-2. 該 Node 處於一個條件等待隊列上, 這個 nextNode 指向 SHARED
+=nextWaiter= 有兩種情況會使用到:
+1. 該 =Node= 處於一個 condition wait queue , 這個 =nextWaiter= 指向該 condition wait queue 的下一個 =Node=
+2. 該 =Node= 處於一個條件等待隊列上, 這個 =nextWaiter= 指向 =SHARED=
 #+begin_src java
  /**
  * Link to next node waiting on condition, or the special
@@ -146,24 +146,23 @@ static final Node SHARED = new Node();
 /** Marker to indicate a node is waiting in exclusive mode */
 static final Node EXCLUSIVE = null;
 #+end_src
-
 *** constructor
-Node 的 constructor 有三種:
-1. 用於創建 SHARED 和 wait queue 的 head
+Node 的 =constructor= 有三種:
+1. 用於創建 =SHARED= 和 wait queue 的 =head=
    #+begin_src java
    Node() {    // Used to establish initial head or SHARED marker
    }
    #+end_src
-2. 用於創建要加入 wait queue 的 Node
-   *注意, 如果 Node 在 wait queue 中, 則 nextWaiter 這個 pointer 是多餘的, AQS 的 Node 利用了這個冗餘性: 當 Node 處在 waiting queue 中時, 以 nextWaiter 紀錄 waiting mode*
+2. 用於創建要 insert 進 wait queue 的 =Node=
+   *注意, 如果 =Node= 在 wait queue 中, 則 =nextWaiter= 這個 pointer 是多餘的, AQS 利用了這個冗餘性: 當 =Node= 處在 waiting queue 中時, 以 =nextWaiter= 紀錄 waiting mode*
    #+begin_src java
    Node(Thread thread, Node mode) {     // Used by addWaiter
        this.nextWaiter = mode;
        this.thread = thread;
    }
    #+end_src
-   另外, 在這裡沒有指定新的 Node 的 waitState, 也就是說, 剛加入 wait queue 尾部的 Node 是處在 waitState = 0 的狀態
-3. 用於創建要加入 condition wait queue 的 Node
+   另外, 在這裡沒有指定新的 =Node= 的 =waitState=, 也就是說, 剛加入 wait queue 尾部的 Node 是處在 =waitState = 0= 的狀態
+3. 用於創建要 insert 進 condition wait queue 的 =Node=
    #+begin_src java
    Node(Thread thread, int waitStatus) { // Used by Condition
        this.waitStatus = waitStatus;
