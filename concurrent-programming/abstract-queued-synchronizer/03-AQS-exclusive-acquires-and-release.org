@@ -66,17 +66,17 @@ protected boolean tryAcquire(int arg) {
 }
 #+end_src
 =tryAcquire(arg)= 是由 =Sync= 實現的 template hook method。 在 =acquire(arg)= 實現中, 有兩種情況下會調用 =tryAcquire(arg)=:
-1. 當 =acquire(arg)= 執行時, 會首先嘗試 =tryAcquire(arg)=, 如果成功則 =return true=, 代表 =acquire(arg)= 已經成功可以退出了。 由於沒有競爭發生, 所以 wait queue 不需要 insert Node, 但 =state= 會被 =tryAcquire= 改變
-2. 當第一次 =tryAcquire(arg)= 失敗代表有競爭發生, thread 會被封裝到 =Node= 進入 wait queue 開始自旋, 當 thread 處於喚醒狀態時, 會首先檢查自己是否為 =head= 後第一個有效的 =node=, 如果是的話會再嘗試一次 =tryAcquire(arg)=
+1. 當 =acquire(arg)= 執行時, 會首先嘗試 =tryAcquire(arg)=, 如果成功則 =return true=, 代表 =acquire(arg)= 已經成功可以退出了。 由於沒有競爭發生, 所以 sync queue 不需要 insert Node, 但 =state= 會被 =tryAcquire= 改變
+2. 當第一次 =tryAcquire(arg)= 失敗代表有競爭發生, thread 會被封裝到 =Node= 進入 sync queue 開始自旋, 當 thread 處於喚醒狀態時, 會首先檢查自己是否為 =head= 後第一個有效的 =node=, 如果是的話會再嘗試一次 =tryAcquire(arg)=
 
 注意, 如果是第二種情況, 如果 =tryAcquire(arg)= 失敗則會進入 park 等待 unpark, 所以需要修改 =node.prev= 的 =waitStatus=
 ** addWaiter(mode)
-=addWaiter= 的職責是, 當 =tryAcquire(arg)= 失敗時, 代表當前的 =Thread= 必須被封裝到 =Node= 中, 並成為 wait queue 的 =tail=
+=addWaiter= 的職責是, 當 =tryAcquire(arg)= 失敗時, 代表當前的 =Thread= 必須被封裝到 =Node= 中, 並成為 sync queue 的 =tail=
 我們明確一下 =addWaiter= 的職責:
-1. =addWaiter= 是必成功的 CAS 操作, 執行完成後會 return =node=, 此時 =node= 就是 wait queue 的 =tail=
-2. =addWaiter= 只負責將 =node= 加入 wait queue, 至於 =node= 處在 wait queue 中, 是要執行一次 =tryAcquire= 還是進入 park ,這屬於 =acquireQueued= 的職責。
+1. =addWaiter= 是必成功的 CAS 操作, 執行完成後會 return =node=, 此時 =node= 就是 sync queue 的 =tail=
+2. =addWaiter= 只負責將 =node= 加入 sync queue, 至於 =node= 處在 sync queue 中, 是要執行一次 =tryAcquire= 還是進入 park ,這屬於 =acquireQueued= 的職責。
 另外, 還有兩個要點:
-1. wait queue 有可能沒被初始化過, 需要先執行初始化
+1. sync queue 有可能沒被初始化過, 需要先執行初始化
 2. 對 =head= 和 =tail= 的操作, 必須是 CAS 操作
 
 =addWaiter=:
@@ -104,36 +104,36 @@ protected boolean tryAcquire(int arg) {
 
 #+end_src
 =addWaiter= 的邏輯如下:
-1. 首先將要進入 wait queue 的 =Node= 準備好
-   準備一個 =Node= =node=, 將當前 =Thread= 封裝到 =node= 中, 作為準備成為 wait queue 的 =tail= 的 =node=
-2. 確認 wait queue 是否存在: 檢查 =head= 是否需要被初始化
+1. 首先將要進入 sync queue 的 =Node= 準備好
+   準備一個 =Node= =node=, 將當前 =Thread= 封裝到 =node= 中, 作為準備成為 sync queue 的 =tail= 的 =node=
+2. 確認 sync queue 是否存在: 檢查 =head= 是否需要被初始化
    * 先確定檢查的邏輯是否正確: =head= 和 =tail=, 要麼同時為 =null=, 要麼同時不為 =null=, 所以檢查 =pred= 等於檢查 =tail=, 也等於檢查 =head=
    * 如果 =head= 需要被初始化, 則直接交給 =enq(node)= 執行初始化
-3. 如果 wait queue 存在, 將 =node= 替換成 =tail=
+3. 如果 sync queue 存在, 將 =node= 替換成 =tail=
    * 對 =tail= 嘗試一次 CAS 操作以替換 =tail=, 如果成功, =return node= (也就是 =tail=)
    * CAS 操作失敗, 說明有其他 =node= 也在嘗試 CAS 替換 =tail=, 此時將 =addWaiter= 的職責移交給 =enq(node)=
 
 注意, =addWaiter= 的邏輯理論就是要完成雙向的 =LinkedList= 的 =insert(node)=:
-1. 在確認 =wait queue= 存在後, 將 =node.prev= 指向 =tail=
+1. 在確認 =sync queue= 存在後, 將 =node.prev= 指向 =tail=
 2. 以 CAS 操作, 將 =node= 替換成 =tail=, 在 CAS 操作成功的前提下, 將 =pred.next= 指向 =node=
 這兩步就是 =addWaiter= 中的兩個 =if= 判斷, 如果都成功完成, 就可以直接 =return node= 並離開 =addWaiter=; 如果其中一步失敗, 都需要將 =addWaiter= 的職責移交給 =enq(node)=
 *** enq(node)
-=enq(node)= 的職責是, 在 =addWaiter= 直接將 =node= =insert= 進 =wait queue= 中失敗時, 接管 =addWaiter= 的職責, 以 CAS 的方式 =insert= =node= 直到成功為止, 是必成功的 CAS 自旋函數。
+=enq(node)= 的職責是, 在 =addWaiter= 直接將 =node= =insert= 進 =sync queue= 中失敗時, 接管 =addWaiter= 的職責, 以 CAS 的方式 =insert= =node= 直到成功為止, 是必成功的 CAS 自旋函數。
 會進入 =enq= 函數有兩種可能:
-1. wait queue 不存在
+1. sync queue 不存在
    注意, 此時 =node.prev= 指向 =null=, 但 =node.prev= 應該指向 =head=, 且 =head.next= 應該指向 =node=
-2. wait queue 存在, 但有其他 =Node= 也在嘗試 =insert= 而發生競爭導致
+2. sync queue 存在, 但有其他 =Node= 也在嘗試 =insert= 而發生競爭導致
    注意, 此時 =node.prev= 已經指向的是一個過期的 =tail=, 並且當前的 =tail.next= 也沒有指向 =node=
 
 簡單來說, =enq= 要做的事情就是確保 =node.prev= 和 =tail.next= 都指向正確的 =Node=
 
-我們先考慮第二種情況, 也就是 wait queue 已經存在的情況, 處理邏輯是: 以 CAS 自旋的方式將 =node.prev= 指向正確的 =Node=, 並將 =Node.next= 指向自身:
+我們先考慮第二種情況, 也就是 sync queue 已經存在的情況, 處理邏輯是: 以 CAS 自旋的方式將 =node.prev= 指向正確的 =Node=, 並將 =Node.next= 指向自身:
 1. 每次進入 while loop 時, 獲取 =tail= 的最新狀態
 2. 先將 =node.prev= 指向最新的 =tail=
 3. 以 CAS 的方式嘗試將 =tail= 替換成 =node=
 4. 如果 CAS 操作成功, 則在 CAS 的保護下將 =tail.next= 指向 =node= 並離開; 如果失敗進入下一輪 while loop 重試
 
-而針對第一種情況, 就是先初始化 wait queue:
+而針對第一種情況, 就是先初始化 sync queue:
 1. 以 CAS 的方式 create =head=
 2. 在 CAS 的保護下, 將 =tail= 指向 =head=
 3. 最後, 離開此 while loop, =node= 在下一次循環嘗試 =insert=, 進入情況二
@@ -164,10 +164,10 @@ protected boolean tryAcquire(int arg) {
  * 當 =compareAndSetTail(t, node)= 成功時, 是將 =tail= 替換成 =node=, 而此時 =t= 依然指向的是過期的 =tail=
  * 注意 =addWaiter= 調用 =enq(node)= 時, 沒有以任何 variable 接收 =enq(node)= 的 =return=
 ** acquireQueued(node, arg)
-=acquireQueued= 是一種自旋, 是 =node= 進入 wait queue 後, 真正進入 *等待* 的函數。 這個 *等待* 策略是: 只要 =node= 還在 wait queue 內, 首先檢查自己是否為 wait queue 中第一個有效 =node=. 如果是的話執行 ==tryAcquire(arg)=, 如果不是的話重設 =node.prev= 的 =waitStatus= 並進入 park, 重複這個過程直到 =node= 離開 wait queue。
+=acquireQueued= 是一種自旋, 是 =node= 進入 sync queue 後, 真正進入 *等待* 的函數。 這個 *等待* 策略是: 只要 =node= 還在 sync queue 內, 首先檢查自己是否為 sync queue 中第一個有效 =node=. 如果是的話執行 ==tryAcquire(arg)=, 如果不是的話重設 =node.prev= 的 =waitStatus= 並進入 park, 重複這個過程直到 =node= 離開 sync queue。
 
-另外, =node= 要離開 wait queue 有兩種方式:
-1. 當自己為第一個有效 =node=, 並且 =tryAcquire(arg)= 成功, 透過 =setHead(node)= 將前面的 =node= 移出 wait queue
+另外, =node= 要離開 sync queue 有兩種方式:
+1. 當自己為第一個有效 =node=, 並且 =tryAcquire(arg)= 成功, 透過 =setHead(node)= 將前面的 =node= 移出 sync queue
 2. 當 =node= 自旋出現異常, 調用了 =cancelAcquire(arg)=, 並且發現 =node= 就是 =tail=, 將自己移出
 #+begin_src java
     final boolean acquireQueued(final Node node, int arg) {
@@ -333,7 +333,7 @@ private void setHead(Node node) {
 3. 在 =shouldParkAfterFailedAcquire= 中, 將 =prev= 指向有效的 =node=, 也就是 =head=, 並退出此次 park 自旋
 4. 再次進入 while loop 後, 發現 =node.prev == head= 成立, 開始進行 =tryAcquire= 自旋
 
-所以, 如果以 =acquire(arg)= 方式來 acquire wait queue 的話, 基本上調用了 =cancelAcquire= 只有三種發展:
+所以, 如果以 =acquire(arg)= 方式來 acquire sync queue 的話, 基本上調用了 =cancelAcquire= 只有三種發展:
 1. 由於自己是 =tail= 直接被移出
 2. 由於自己的 next 會成為 =head= 第一個有效 =node=, 當它 =tryAcquire= 成功時會透過 =setHead= 將這個 =node= 移出
 3. 其他情況, 繼續 park
@@ -358,7 +358,7 @@ private void setHead(Node node) {
             selfInterrupt();
     }
 #+end_src
-這裡要在次強調, =acquire= 不響應 interrupt 是指在 wait queue park 的線程如果收到 interrupt 進入 =RUNNABLE= 後不立即拋出 =InterruptedException=, 而是透過 =interrupted = true= 來紀錄曾經被 interrupt, 然後進入下一輪 =acquireQueued= 自旋, 如果 =p == head= 不成立, 該線程會繼續 park 自旋; 也就是只要 =node= 沒有來到 =head.next=, 都不會響應 interrupt; 直到當 =p == head= 成立時, 透過成功的 =acquireQueued= CAS 自旋 =return interrupted= 狀態, 將響應 interrupt 的職責交給 =acquire(arg)= 中的 =selfInterrupt()=
+這裡要在次強調, =acquire= 不響應 interrupt 是指在 sync queue park 的線程如果收到 interrupt 進入 =RUNNABLE= 後不立即拋出 =InterruptedException=, 而是透過 =interrupted = true= 來紀錄曾經被 interrupt, 然後進入下一輪 =acquireQueued= 自旋, 如果 =p == head= 不成立, 該線程會繼續 park 自旋; 也就是只要 =node= 沒有來到 =head.next=, 都不會響應 interrupt; 直到當 =p == head= 成立時, 透過成功的 =acquireQueued= CAS 自旋 =return interrupted= 狀態, 將響應 interrupt 的職責交給 =acquire(arg)= 中的 =selfInterrupt()=
 
 而 =selfInterrupt()= 執行的自己 interrupt 自己:
 #+begin_src java
@@ -387,7 +387,8 @@ private void setHead(Node node) {
      *        can represent anything you like.
      * @throws InterruptedException if the current thread is interrupted
      */
-    public final void acquireInterruptibly(int arg) throws InterruptedException {
+    public final void acquireInterruptibly(int arg)
+            throws InterruptedException {
         if (Thread.interrupted())
             throw new InterruptedException();
         if (!tryAcquire(arg))
@@ -399,8 +400,8 @@ private void setHead(Node node) {
 2. 以 tryAcquire(arg) 嘗試一次 acquire
 3. tryAcquire(arg) 不成功, 則執行 =doAcquireInterruptibly(arg)= 進入自旋
 ** doAcquireInterruptibly(arg)
-當 =doAcquireInterruptibly= 被調用, 通樣說明前一步調用 =tryAcquire= 因有競爭發生而失敗, 當前 thread 要封裝成 =Node= 進入 await queue 中自旋, 實現邏輯如下:
-1. 調用 =addWaiter=, 完成 wait queue 的 insert =Node=
+當 =doAcquireInterruptibly= 被調用, 通樣說明前一步調用 =tryAcquire= 因有競爭發生而失敗, 當前 thread 要封裝成 =Node= 進入 async queue 中自旋, 實現邏輯如下:
+1. 調用 =addWaiter=, 完成 sync queue 的 insert =Node=
 2. 實現與 =acquireQueued= 類似的自旋邏輯, 區別在於 park 自旋時對 interrupt 檢查後的處裡方式
 
 #+begin_src java
@@ -441,7 +442,7 @@ private void setHead(Node node) {
 1. 是帶有 timeout 機制的 acquire 自旋
 2. 是一種 try acquire 版本的實現, 調用職責由 subclass 進行委派
 
-=tryAcquireNanos= 與 =tryAcquire= 真正的區別在於, 調用 =tryAcquireNanos= 有可能涉及對 wait queue 的操作; 而 =tryAcquire= 的實現沒有辦法操作到 wait queue, 因為所有其他可以操作 wait queue 的方法都被 private 保護了。
+=tryAcquireNanos= 與 =tryAcquire= 真正的區別在於, 調用 =tryAcquireNanos= 有可能涉及對 sync queue 的操作; 而 =tryAcquire= 的實現沒有辦法操作到 sync queue, 因為所有其他可以操作 sync queue 的方法都被 private 保護了。
 
 雖然 =tryAcquireNanos= 的調用職責屬於 subclass, 但是它依然屬於 template method, 這是由於 =tryAcquireNanos= 的 =doAcquireNanos= 實現只依賴兩種方法:
 1. 其他 template methods
@@ -549,7 +550,7 @@ private void setHead(Node node) {
 =tryAcquireNanos= 的 =cancelAcquire= 與 =acquireInterruptibly= 的完全相同。
 * release(int arg)
 當 thread 執行 =release(arg)= 時, 以下條件是成立的:
-1. 當前 thread 已經成功 acquire, 是 wait queue 的 owner
+1. 當前 thread 已經成功 acquire, 是 sync queue 的 owner
 2. 當前 =tryAcquire= 操作成功, 因此對 =state= 的修改是由 owner 完成的, 在 release 被執行前, 只有 owner 知道如何撤銷這個 update
 3. 當前可能有其他 thread 或是 =node= 也同時在 =tryAcquire= 自旋, 但由於他們都不是 owner, 因此處在 =tryAcquire= 自旋
 4. 要執行 release(arg) 時, 代表 owner 對臨界資源的操作已經結束, owner 準備讓出所有權
@@ -575,59 +576,24 @@ private void setHead(Node node) {
     }
 #+end_src
 注意, 雖然 =release(arg)= 實現非常簡潔, 但是有相當多的細節:
- * =tryRelease(arg)= 負責 =tryAcquire(arg)= 的撤銷, 也只涉及對 =tryAcquire(arg)= 的撤銷, 不涉及對 wait queue 的維護
- * =tryRelease(arg)= 如果 return =true=, 代表 =state= 將回到最初使的值, 但不代表 wait queue 中沒有 =node= 在等待, 更不代表這些 =node= 不是處在 park 自旋等待
+ * =tryRelease(arg)= 負責 =tryAcquire(arg)= 的撤銷, 也只涉及對 =tryAcquire(arg)= 的撤銷, 不涉及對 sync queue 的維護
+ * =tryRelease(arg)= 如果 return =true=, 代表 =state= 將回到最初使的值, 但不代表 sync queue 中沒有 =node= 在等待, 更不代表這些 =node= 不是處在 park 自旋等待
 
 理論上我們可以將 =tryRelease(arg)= 和 =release(arg)= 做以下職責劃分:
  * =tryRelease(arg)= 負責 =tryAcquire(arg)= 的撤銷操作, 操作完畢後只要 =state= 回到最初使狀態, 則 return =true=
- * =release(arg)= 無論如何會執行一次 =tryRelease(arg)= 對 =state= 進行撤銷, 如果 =state= 回到初始狀態, 代表可以 =unparkSuccessor(h)= 推一下 wait queue, 喚醒 =successor=
+ * =release(arg)= 無論如何會執行一次 =tryRelease(arg)= 對 =state= 進行撤銷, 如果 =state= 回到初始狀態, 代表可以 =unparkSuccessor(h)= 推一下 sync queue, 喚醒 =successor=
 
-注意, 當 =tryRelease(arg)= return =true= 時, 才需要嘗試 =unparkSuccessor(h)= 推動一下 wait queue 喚醒 =successor=; 這一句話等價於: 當 =tryRelease(arg)= return =false= 時, 不需要嘗試 =unparkSuccessor(h)=, 也就是說 =tryRelease= 的實現相當關鍵, 如果 =tryRelease(arg)= 要 return =false=, 必須確保 =h.waitStatus= 等於 =0=, 且 =head= 的第一個有效的 =node= 必須處在 =tryAcquire= 自旋才行。
+注意, 當 =tryRelease(arg)= return =true= 時, 才需要嘗試 =unparkSuccessor(h)= 推動一下 sync queue 喚醒 =successor=; 這一句話等價於: 當 =tryRelease(arg)= return =false= 時, 不需要嘗試 =unparkSuccessor(h)=, 也就是說 =tryRelease= 的實現相當關鍵, 如果 =tryRelease(arg)= 要 return =false=, 必須確保 =h.waitStatus= 等於 =0=, 且 =head= 的第一個有效的 =node= 必須處在 =tryAcquire= 自旋才行。
 * exclusive acquires 和 release 的總結
 總結來說, exclusive acquires 有以下特點:
- * 在進入 wait queue 前, 首先執行一次 =tryAcquire=
- * 如果已經在 wait queue 內被 unpark, 只有自己是第一個有效的 =node= 時, 嘗試一次 =tryAcquire=, 如果失敗就繼續 park
+ * 在進入 sync queue 前, 首先執行一次 =tryAcquire=
+ * 如果已經在 sync queue 內被 unpark, 只有自己是第一個有效的 =node= 時, 嘗試一次 =tryAcquire=, 如果失敗就繼續 park
  * 三種 acquires 最主要的區別在於 interrupt 是否推遲響應, 以及推遲響應的實現上
-** acquaint(arg) 的風格問題
-有趣的事情是, =acquireInterruptibly= 和 =tryAcquireNanos= 的自旋函數都以 =do...= 開頭, 並且包含了 =acquire(arg)= 中 =addWaiter(node)= 和自旋的責任, 這使 =acquire(arg)= 的風格與結構與其他兩種版本不大相同, 我們可以做以下改寫:
-1. 將 =acquireQueued= 與 =addWaiter= 整合成 =doAcquireDeferInterruption=
-#+begin_src java
-    private boolean doAcquireDeferInterruption(int arg) {
-        final Node node = addWaiter(Node.EXCLUSIVE);
-        boolean failed = true;
-        boolean interrupted = false;
-        try {
-            for (;;) {
-                final Node p = node.predecessor();
-                if (p == head && tryAcquire(arg)) {
-                    setHead(node);
-                    p.next = null; // help GC
-                    failed = false;
-                    return interrupted;
-                }
-                if (shouldParkAfterFailedAcquire(p, node) &&
-                    parkAndCheckInterrupt())
-                    interrupted = true;
-            }
-        } finally {
-            if (failed)
-                cancelAcquire(node);
-        }
-    }
-#+end_src
-2. 改寫 =acquire(arg)=
-#+begin_src java
-    public final void acquire(int arg) {
-        if (!tryAcquire(arg) &&
-            doAcquireDeferInterruption(arg))
-            selfInterrupt();
-    }
-#+end_src
 ** tryAcquire 和 tryRelease 的職責
-注意, =tryAcquire= 和 =tryRelease= 只負責不涉及 wait queue 維護的部份, 也就是只對 =state= 的修改與撤銷, 而兩種方法都會 return =boolean= 讓後續的方法接手 wait queue 的維護, 比如說在各種版本的 acquires 實現, 都首先嘗試了一次 =tryAcquire=, 如果失敗了則需要操作 =insert(node)=, 而 =release(arg)= 則要負責在 =tryRelease(arg)= return =false= 時, 進行是否需要 unpark =head= 的判斷。 不過由於 AQS 將涉及 wait queue 維護的方法都 private 了, 所以 =tryAcquire= 和 =tryRelease= 的實現都碰不到 wait queue, 從設計上確保了 AQS 的安全。
-** wait queue 的正常工作
-注意, 由於 default 的 =waitStatus= 就是 =0=, 並且只被後面到來的 =node= 執行 =shouldParkAfterFailedAcquire= 能將 =waitStatus= 改為 =SIGNAL=, 且只有 =release(arg)= 和 =cancelAcquire(node)= 中有調用 =unparkSuccessor(node)= 能將 =successor= unpark 喚醒, 此時 =waitStatus= 才可能再次被改為 =0=, 並且只要涉及跨越 =node= 的行為, 都會確保 =CANCELLED= 的 =node= 被跳過、 =node.prev= 以及 =node.next= 的有效性, 從而確保了整個 wait queue 能透過檢查 =waitStatus= 而正常工作:
-1. 每個在 wait queue 的 =node= 大多處在 park 自旋
+注意, =tryAcquire= 和 =tryRelease= 只負責不涉及 sync queue 維護的部份, 也就是只對 =state= 的修改與撤銷, 而兩種方法都會 return =boolean= 讓後續的方法接手 sync queue 的維護, 比如說在各種版本的 acquires 實現, 都首先嘗試了一次 =tryAcquire=, 如果失敗了則需要操作 =insert(node)=, 而 =release(arg)= 則要負責在 =tryRelease(arg)= return =false= 時, 進行是否需要 unpark =head= 的判斷。 不過由於 AQS 將涉及 sync queue 維護的方法都 private 了, 所以 =tryAcquire= 和 =tryRelease= 的實現都碰不到 sync queue, 從設計上確保了 AQS 的安全。
+** sync queue 的正常工作
+注意, 由於 default 的 =waitStatus= 就是 =0=, 並且只被後面到來的 =node= 執行 =shouldParkAfterFailedAcquire= 能將 =waitStatus= 改為 =SIGNAL=, 且只有 =release(arg)= 和 =cancelAcquire(node)= 中有調用 =unparkSuccessor(node)= 能將 =successor= unpark 喚醒, 此時 =waitStatus= 才可能再次被改為 =0=, 並且只要涉及跨越 =node= 的行為, 都會確保 =CANCELLED= 的 =node= 被跳過、 =node.prev= 以及 =node.next= 的有效性, 從而確保了整個 sync queue 能透過檢查 =waitStatus= 而正常工作:
+1. 每個在 sync queue 的 =node= 大多處在 park 自旋
 2. 當 =waitStatus = 0=, 一定確保 =successor= 被 unpark
 3. 當 =node= 要進入 park, 一定確保 =predecessor= 的 =waitStatus= 為 =SIGNAL=
-4. 當 =node= 在 wait queue 中自旋, 但意外中止時, 必定執行 =cancelAcquire= 將 =node= 標記為 =CANCELLED=
+4. 當 =node= 在 sync queue 中自旋, 但意外中止時, 必定執行 =cancelAcquire= 將 =node= 標記為 =CANCELLED=
