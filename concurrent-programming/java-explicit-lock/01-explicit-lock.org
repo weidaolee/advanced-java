@@ -1,11 +1,9 @@
 #+TITLE: Java 的顯式鎖
 使用 Java 的隱式鎖時, 鎖的膨脹機制、鎖的 Monitor 的搶佔和釋放, 都是由 JVM 來完成, 在語言層面我們只宣告 synchronized 的對象和範圍, 不需要在語言層面做額外的控制。 隱式鎖的機制讓 Java 的代碼能更聚焦在業務邏輯上, 但是隱式鎖的功能相對單一, 不具備一些能讓併發任務更高級的需求, 比如:
-1. *支持超時*
+1. *支持 timeout*
    為了避免過長的飢餓問題, 讓達到飢餓超時的線程拋出異常返回
-2. *支持響應中斷*
+2. *支持立即響應 interrupt*
    一種死鎖問題的解決方案是, 讓其中一個線程響應中斷信號, 避免無限等待下去
-3. *支持非阻塞獲取鎖*
-   讓上鎖失敗的線程直接拋出異常返回, 而不是進入阻塞等待
 4. *支持公平調度*
    Java 的隱式鎖是不支持公平調度的, 而 JUC 的 ReentrantLock 兩種調度都支持
 5. *多條件等待隊列*
@@ -141,7 +139,7 @@ if (lock.tryLock()) {
    由於 lock.tryLock() 會 return boolean, 如果 return false 表示嘗試失敗, 進入 else {...}
 2. 處裡上鎖失敗的邏輯必須在 else {...} 內
    上鎖失敗, 沒有進入臨界區, 線程應該處在 RUNNABLE 狀態
-* Condition interface
+* Condition
 當我們的要鎖的對象不只一個的時候, 我們需要透過線程間通信來協調鎖的資源的申請與釋放, 在隱式鎖我們透過 wait(), notify(), notifyAll() 來完成, 而在顯式鎖是透過 implements 了 Condition 的 concrete class 來完成, 但 Condition 為了避免與隱式鎖的 Waite-Notify 混搖, Condition 的方法都做了重命名:
 #+begin_src java
 public interface Condition {
@@ -160,8 +158,17 @@ public interface Condition {
     void signalAll();
 }
 #+end_src
+=Condition= 是 JUC 為提供與 Java 隱式鎖 Monitor 中的 Wait-Notify 相似的、用於線程間通信的機制, 這個機制與隱式鎖的 Wait-Notify 機制有以下幾個不同點:
+1. =Condition= 是 JUC 實現的, 而 Java 隱式鎖的 Wait-Notify 是由底層 JVM 實現
+2. =Condition= 的方法 await/signal 是 =Condition= 的方法, Java 隱式鎖的 wait/notify 是 =Object= 的方法
+3. =Condition= 是 AQS 線程同步技術通用的, Java 隱式鎖的 Wait-Notify 只能用於互斥/悲觀鎖
+4. =Condition= 可以提供多個 condition wait queue, 而 Java 隱式鎖的 Wait-Notify 只能提供一個
+5. =Condition= 可以支持立即響應異常、 timeout 響應異常, Java 隱式鎖的 Wait-Notify 只能等到成功上鎖後響應
 
 以下是透過 Condition 來完成線程間通信的案例:
+1. 我們創建 lock, 以及與 lock 對應的 condition
+2. 在 =WaitThread= 的 =run()= 中, 我們 =lock()= 並執行 =condition.await()=, 這樣會直接 release 對 lock 的持有
+3. 在 =NotifyThread= 的 =run()= 中, 我們 =lock()= 並執行 =condition.signal()=, 這樣會喚醒 =WaitThread=
 #+begin_src java
 public class ConditionDemo {
     static Lock lock = new ReentrantLock();
@@ -209,6 +216,7 @@ public class ConditionDemo {
     }
 }
 #+end_src
+注意, 當 =NotifyThread=
 
 * LockSupport
 JUC 提供了阻塞/喚醒線程的方法, 這些方法很接近 Thread.sleep(), 只是這些方法被時現在 LockSupport 裡:
