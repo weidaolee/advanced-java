@@ -1,0 +1,301 @@
+#+TITLE: AQS 其他重要的方法
+* acquire/release 依賴的方法
+受限於篇幅, 有些重要、通用的, 且用於維護 sync queue 的重要方法, 在各種版本的 acquire/release 中如果有遇到, 只關注該版本下調用這些方法後對 sync queue 造成的影響; 而這些方法詳細、全面的討論我們在這裡詳細說明, 這些方法包含:
+- cancelAcquire(node)
+- unparkSuccessor(node)
+** cancelAcquire(node)
+=cancelAcquire= 負責所有 acquires 版本中 (包含 =SHARED= mode 下), 當 node 已經在 wait queue 中自旋但是無法繼續下去時, 必須要執行對該 node 的措施, 以確保 wait queue 的正確性。 =cancelAcquire= 的操作步驟可以分為兩類:
+ * 針對這個即將失效的 =node= 的維護
+   1. 當 =node= 已經是 =null= 時, 直接退出
+   2. 將當前 =node.thread= 指向 =null=, 讓 thread 脫離 wait queue 的管束
+   3. 將自身 =node.waitStatus= 設置為 =CANCELLED=
+ * 針對 wait queue 的維護:
+   這個部份有許多細節, 我們會在下面詳述, 主要的邏輯有以下:
+   1. 將有效的 =pred=  找到, 並將 =pred.next= 指向 =node.next=
+   2. 將 =pred.waitStatus= 設置成 =SIGNAL=
+#+begin_src java
+    private void cancelAcquire(Node node) {
+        // Ignore if node doesn't exist
+        if (node == null)
+            return;
+
+        node.thread = null;
+
+        // Skip cancelled predecessors
+        Node pred = node.prev;
+        while (pred.waitStatus > 0)
+            node.prev = pred = pred.prev;
+
+        // predNext is the apparent node to unsplice. CASes below will
+        // fail if not, in which case, we lost race vs another cancel
+        // or signal, so no further action is necessary.
+        Node predNext = pred.next;
+
+        // Can use unconditional write instead of CAS here.
+        // After this atomic step, other Nodes can skip past us.
+        // Before, we are free of interference from other threads.
+        node.waitStatus = Node.CANCELLED;
+
+        // If we are the tail, remove ourselves.
+        if (node == tail && compareAndSetTail(node, pred)) {
+            compareAndSetNext(pred, predNext, null);
+        } else {
+            // If successor needs signal, try to set pred's next-link
+            // so it will get one. Otherwise wake it up to propagate.
+            int ws;
+            if (pred != head &&
+                ((ws = pred.waitStatus) == Node.SIGNAL ||
+                 (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
+                pred.thread != null) {
+                Node next = node.next;
+                if (next != null && next.waitStatus <= 0)
+                    compareAndSetNext(pred, predNext, next);
+            } else {
+                unparkSuccessor(node);
+            }
+
+            node.next = node; // help GC
+        }
+    }
+#+end_src
+*** 失效的 node 被移出 wait queue 的時機
+實際上, 一個被 cancel 的 node 並不會立刻被移出 wait queue, 而是在以下兩種情況成立時, 才會被移出 wait queue:
+1. =cancelAcquire= 過程中發現自己是 =tail=, 將自己直接移出
+2. 該 =node= 的有效的 =next= 被 unpark, 發現自己 =node.prev == head= 成立, 且 =tryAcquire= 成功時, 透過 =setHead= 將前面無論是 =head= 或是處於 =CANCELLED= 的失效 =node= 一併移出
+
+這也是為什麼其他正常的 =node= 才會以 =node.prev == head= 來確認自己是否是 =head.next=; 實際上並不是確認自己是否是 =head.next=, 而是確認自己是 =head= 之後的第一個有效的 =node=
+*** node 在 cancelAcquire 執行之後的狀態
+如果一個 =node= 在執行 =cancelAcquire= 後, 除了 =node.waitStatus = CANCELLED= 之外, 這個 =node.prev= 和 =node.next= 有以下變化:
+ * =node.prev= 依然指向一個 =node=, 這個 =node= 可以是有效的, 也可以是無效的, 但不可以是 =null=, =node.prev= 用於表示自己在 wait queue 真實的位置
+ * =node.next= 指向自身
+也就是說, wait queue 如果要遍歷自己所有的 =node=, 或者需要查找一個 =node=, 必須從 =tail= 往前找, 而不能從某個 =node= 往後找。
+*** 針對 wait queue 的維護
+接下來我們討論 =cancelAcquire= 中對 wait queue 的維護, 可以分為兩部份:
+1. 將有效的 =pred=  找到, 並將 =pred.next= 指向 =node.next=
+#+begin_src java
+        // Skip cancelled predecessors
+        Node pred = node.prev;
+        while (pred.waitStatus > 0)
+            node.prev = pred = pred.prev;
+
+        // predNext is the apparent node to unsplice. CASes below will
+        // fail if not, in which case, we lost race vs another cancel
+        // or signal, so no further action is necessary.
+        Node predNext = pred.next;
+
+#+end_src
+2. 將 =pred.waitStatus= 設置成 =SIGNAL=
+#+begin_src java
+        if (node == tail && compareAndSetTail(node, pred)) {
+            compareAndSetNext(pred, predNext, null);
+        } else {
+            // If successor needs signal, try to set pred's next-link
+            // so it will get one. Otherwise wake it up to propagate.
+            int ws;
+            if (pred != head &&
+                ((ws = pred.waitStatus) == Node.SIGNAL ||
+                 (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
+                pred.thread != null) {
+                Node next = node.next;
+                if (next != null && next.waitStatus <= 0)
+                    compareAndSetNext(pred, predNext, next);
+            } else {
+                unparkSuccessor(node);
+            }
+
+            node.next = node; // help GC
+        }
+#+end_src
+ * =node= 處於 =tail=
+   如果對這個要被 cancel 的 =node= 的維護結束後, 如果該 =node= 處於 =tail=, 會直接以 =compareAndSetNext(pred, predNext, null)= 將 =tail= 設置為 =null=
+ * =node= 不是 =head= 後的第一個有效的 =node=
+   這裡的操作有點細緻。 首先, 如果 =pred.waitStatus = SIGNAL=, 直接執行 =compareAndSetNext(pred, predNext, next)=; 然後, 如果 =pred.waitStatus < 0= 則需要 執行 =compareAndSetWaitStatus(pred, ws, Node.SIGNAL)=, 以 CAS 方式將 =pred.waitStatus= 設置為 =SIGNAL=, 這一步設置成功後才會 =compareAndSetNext(pred, predNext, next)=, 這一步如果失敗, 則代表 =pred.waitStatus= 的狀態發生改變, 會執行 =else= 中的 =unparkSuccessor(node)=
+ * =node= 是 =head= 後第一個有效的 =node=
+   這種情況直接執行 =unparkSuccessor(node)=
+
+注意, 我們不僅在 =cancelAcquire(node)= 中會重新 link 有效的 =prev=, 我們也在 =shouldParkAfterFailedAcquire(p, node)= 重新 link 有效的 prev, 這就是為了確保當 =cancelAcquire= 過程中, 如果 =compareAndSetWaitStatus(pred, ws, Node.SIGNAL)= 失敗時, 透過 =unparkSuccessor= 喚醒後面的有效 =next= 重新 link 正確的 =prev=
+
+注意 [[file:03-AQS-exclusive-acquires-and-release.org::*shouldParkAfterFailedAcquire(p, node)][shouldParkAfterFailedAcquire(p, node)]] 的實現, 會從新 link 有效的 =pred= 後, 將 =pred.waitStatus= 設置為 =SIGNAL=, 並查看 [[*unparkSuccessor 在 cancelAcquire 中被調用][unparkSuccessor 在 cancelAcquire 中被調用]]
+** unparkSuccessor(node)
+=unparkSuccessor= 的職責有以下:
+1. 將當前 =node.waitStatus= 設成 =0=
+   除了 =cancelAcquire= 的情況, 執行 =unparkSuccessor(node)= 後, =node.next= 應解除 park 狀態做檢查, 無論是否需要重新進入 park, 當前 =node.waitStatus= 應設成 =0=
+2. 需要找到有效的 =successor=
+   這一步比較特別, 因為被 cancel 掉而失效的 =node=, 其 =node.next= 已經指向自身, 只剩下 =node.prev= 還有作用, 因此比須從 =tail= 往前找
+3. 最後, 對 =successor= 執行 unpark
+#+begin_src java
+    private void unparkSuccessor(Node node) {
+        /*
+         * If status is negative (i.e., possibly needing signal) try
+         * to clear in anticipation of signalling.  It is OK if this
+         * fails or if status is changed by waiting thread.
+         */
+        int ws = node.waitStatus;
+        if (ws < 0)
+            compareAndSetWaitStatus(node, ws, 0);
+
+        /*
+         * Thread to unpark is held in successor, which is normally
+         * just the next node.  But if cancelled or apparently null,
+         * traverse backwards from tail to find the actual
+         * non-cancelled successor.
+         */
+        Node s = node.next;
+        if (s == null || s.waitStatus > 0) {
+            s = null;
+            for (Node t = tail; t != null && t != node; t = t.prev)
+                if (t.waitStatus <= 0)
+                    s = t;
+        }
+        if (s != null)
+            LockSupport.unpark(s.thread);
+    }
+#+end_src
+*** unparkSuccessor 在 cancelAcquire 中被調用
+在 =cancelAcquire(node)= 有兩種情況會調用 =unparkSuccessor(node)=:
+1. 當 =pred= 顯然是 =head= 時
+2. 當 =node= 不是 =tail=, 且 =pred= 不是 =head= 時, 如果執行 =compareAndSetWaitStatus(pred, ws, Node.SIGNAL)= 失敗時
+
+注意, 如果執行 =unparkSuccessor(node)=, 當前 =node.waitStatus= 會被設為 =0=, 這樣使得 =cancelAcquire= 的行為有點迷惑, 實際上 =prev= 的 =waitStatus = 0= 完全只代表 =node= 當前不在 park 的狀態, 無論是否要重新進入 park, 只要正在工作中都應設置為 =0=, 如果有需要重新進入 park, 透過 =shouldParkAfterFailedAcquire= 重設為 =SIGNAL= 即可, 我們在此針對這種情況做分析:
+1. 當 =node.waitStatus = CANCELLED= 時, 會因為 =ws < 0= 不成立而不會對 =node.waitStatus= 狀態進行改變
+2. 當 =node.waitStatus= 被改為其他狀態, 導致 =compareAndSetWaitStatus(pred, ws, Node.SIGNAL)= 失敗時, =node.waitStatus= 會被設為 =0=, 代表 =successor= 的 park 狀態被解除
+
+但這樣就非常迷惑, 因為根據 AQS 的設計思想, 只有在 =pred= 為 =head= 時, 當前 =node= 才可以進行 =tryAcquire= 自旋, 也就是說 wait queue 中的其他 node 不應該處在 =waitStatus = 0= 的狀態, 要解決這個迷惑, 或們直接附上 =shouldParkAfterFailedAcquire= 的代碼:
+#+begin_src java
+    private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+        int ws = pred.waitStatus;
+        if (ws == Node.SIGNAL)
+            /*
+             * This node has already set status asking a release
+             * to signal it, so it can safely park.
+             */
+            return true;
+        if (ws > 0) {
+            /*
+             * Predecessor was cancelled. Skip over predecessors and
+             * indicate retry.
+             */
+            do {
+                node.prev = pred = pred.prev;
+            } while (pred.waitStatus > 0);
+            pred.next = node;
+        } else {
+            /*
+             * waitStatus must be 0 or PROPAGATE.  Indicate that we
+             * need a signal, but don't park yet.  Caller will need to
+             * retry to make sure it cannot acquire before parking.
+             */
+            compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+        }
+        return false;
+    }
+#+end_src
+* Internal Support Conditions 的方法
+=ConditionObject= 中的方法如果涉及到對 sync queue 的維護, 這些方法通常是被實現在 AQS 中被允許 =ConditionObject= 調用, 在 AQS source code 中, 這些方法是在 comment ///Internal support methods for Conditions/ 之後的方法。 這些方法包含以下:
+** fullyRelease(arg)
+=fullyRelease= 只在 =ConditionObject= 的 =await= 系列方法中被調用, 其目的是: 由於調用了 =await= 方法的線程雖然 =tryAcquire= 成功, 但執行 =condition.await()= 又必須立刻讓出 sync queue 的持有, 也就是說需要 unpark sync queue 下一個有效 =Node=:
+
+#+begin_src java
+    /**
+     * Invokes release with current state value; returns saved state.
+     * Cancels node and throws exception on failure.
+     * @param node the condition node for this wait
+     * @return previous sync state
+     */
+    final int fullyRelease(Node node) {
+        boolean failed = true;
+        try {
+            int savedState = getState();
+            if (release(savedState)) {
+                failed = false;
+                return savedState;
+            } else {
+                throw new IllegalMonitorStateException();
+            }
+        } finally {
+            if (failed)
+                node.waitStatus = Node.CANCELLED;
+        }
+    }
+
+#+end_src
+=fullyRelease= 有以下重點:
+1. 執行 =release= 前會以 =savedState= 紀錄 release 前的 =state=
+   注意, 這是 AQS sync queue 的 =state=, 不是 =Node.waitStatus=
+2. 可以調用 =fullyRelease(arg)= 的時機非常關鍵
+   如果 =release(savedState)= 失敗會拋出 =IllegalMonitorStateException= 異常, 這種異常用於聲明我們對 =state= 的維護有根本上的錯誤, 而 =release(arg)= 只有在 =tryRelease(arg)= 成功將 =state= 還原到最初使狀態後, 才會 return =true=, 並且會執行 =doRelease()=, 以 unpark 下一個有效的 node
+注意, =release(savedState)= 會執兩個部份, 也就是我們先前提到的先 =try= 後 =do=, 只有最終 =doRelease= 成功才 return =true=:
+#+begin_src java
+    public final boolean release(int arg) {
+        if (tryRelease(arg)) {
+            doRelease();
+            return true;
+        }
+        return false;
+    }
+#+end_src
+所以如果 =fullyRelease= 被調用時, =tryRelease(savedState)= 要是沒能將 =state= 還原成最初的狀態, 都代表 =fullyRelease= 失敗。
+** isOnSyncQueue(node)
+有時後, 我們需要判斷一個 =Node= 是處在 sync queue 中, 還是處在某個 condition queue 中, 則調用 =isOnSyncQueue(node)= 來確認。 注意這裡每一個 =if= 判斷的對象都是 volatile 的, 並且都是以 CAS 操作修改的:
+1. 當 =node.waitStatus= 是 =CONDITION= 時, 代表 =node= 一定處於某個 condition queue 中
+2. 當 =node.prev= 是 =null= 時, 代表 =node= 一定處於某個 condition queue 中
+3. 當 =node.prev= 是 =null= 時, 尚未確定
+   注意, 如果將原本在 condition queue 中的 =node= 轉移到 sync queue 中時, 是需要依賴 CAS 自旋過程, 這個過程在執行完之前, =node.prev= 可能已經是 link 好的
+4. 當 =node.next= 不是 =null= 時, 代表 =node= 一定處於 sync queue 中
+   由於 =addWaiter= 會調用 =enq= 方法, 這個方法會確保 =prev= 已經被正確 link, 也就是 =node= 如果有 =next=, 代表它一定是已經在 sync queue 中
+5. 最後, 當以上條件都不成立時, 執行 =findNodeFromTail(node)= 從 sync queue 尾部找起
+
+#+begin_src java
+    /**
+     * Returns true if a node, always one that was initially placed on
+     * a condition queue, is now waiting to reacquire on sync queue.
+     * @param node the node
+     * @return true if is reacquiring
+     */
+    final boolean isOnSyncQueue(Node node) {
+        if (node.waitStatus == Node.CONDITION || node.prev == null)
+            return false;
+        if (node.next != null) // If has successor, it must be on queue
+            return true;
+        /*
+         * node.prev can be non-null, but not yet on queue because
+         * the CAS to place it on queue can fail. So we have to
+         * traverse from tail to make sure it actually made it.  It
+         * will always be near the tail in calls to this method, and
+         * unless the CAS failed (which is unlikely), it will be
+         * there, so we hardly ever traverse much.
+         */
+        return findNodeFromTail(node);
+    }
+
+#+end_src
+** findNodeFromTail(node)
+必須從尾部找起的邏輯很簡單, 因為被 cancelled 的 =next= 指向自身, 所以必須從尾部找起:
+#+begin_src java
+    private boolean findNodeFromTail(Node node) {
+        Node t = tail;
+        for (;;) {
+            if (t == node)
+                return true;
+            if (t == null)
+                return false;
+            t = t.prev;
+        }
+    }
+#+end_src
+注意, 如果 =t= 為 =null= 代表已經找變了整個 sync queue 而已經來到 =head= 的位置, 所以 return =false=
+* 提供用於檢查 sync queue 狀態的方法
+** hasQueuedThreads()
+...
+** hasContended()
+...
+** getFirstQueuedThread()
+...
+*** fullGetFirstQueuedThread()
+...
+** isQueued(Thread thread)
+...
+** apparentlyFirstQueuedIsExclusive()
+...
+** hasQueuedPredecessors()
+...

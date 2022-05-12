@@ -1,0 +1,349 @@
+#+TITLE: AQS 的重構
+* exclusive acquire/release 代碼重構
+在討論 shared acquires/release 之前, 我們先討論一下 exclusive 的 acquires/release 的代碼結構與風格, 因為我們將指出對 =acquire(arg)= 和 =release(arg)= 做重構, 可以使所有的 acquires/ release 方法擁有完全一致的實現結構與風格, 這種結構和風格的一致性是會體現在 exclusive/shared 下所有版本的 acquires/release
+** exclusive acquires 的重構
+=acquireInterruptibly= 和 =tryAcquireNanos= 的自旋函數都以 =do...= 開頭, 並且包含了 =acquire(arg)= 中 =addWaiter(node)= 和自旋的責任, 這使 =acquire(arg)= 的風格與結構與其他兩種版本不大相同, 我們可以做以下改寫:
+1. 將 =acquireQueued= 與 =addWaiter= 整合成 =doAcquire=
+#+begin_src java
+    private void doAcquire(int arg) {
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    if (interrupted)
+                        selfInterrupt();
+                    // 修改 =failed= 為 false 必須在檢查 interrupted 之後,
+                    // 以確保 =selfInterrupt()= 執行前 finally 中的 cancelAcquire 能被正確執行。
+                    failed = false;
+                    return;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    interrupted = true;
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+#+end_src
+注意, 修改 =failed= 為 false 必須在檢查 =interrupted= 之後, 以確保 =selfInterrupt()= 執行前 =finally= 中的 =cancelAcquire= 能被正確執行。
+2. 改寫 =acquire(arg)=
+#+begin_src java
+    public final void acquire(int arg) {
+        if (!tryAcquire(arg))
+            doAcquire(arg);
+    }
+#+end_src
+** exclusive release 的重構
+同樣的, =release(arg)= 可以做以下改寫:
+1. =doRelease()= 方法
+#+begin_src java
+    private void doRelease() {
+        Node h = head;
+        if(h != null && h.waitStatus != 0)
+            unparkSuccessor(h);
+    }
+#+end_src
+2. =release(arg)= 的改寫
+#+begin_src java
+    public final boolean release(int arg) {
+        if (tryRelease(arg)) {
+            doRelease();
+            return true;
+        }
+        return false;
+    }
+#+end_src
+* AQS acquires/release 統一的代碼結構與風格
+這樣的重構能使 acquire/release 的流程更加清晰、職責劃分更加明確:
+ * 所有的 acquire/release 先 =try=, 後 =do=
+ * 所有的 =try= 方法不涉及對 sync queue 的維護
+ * 所有的 =do= 方法涉及對 sync queue 的維護
+** 推遲響應 interrupt 的 acquire
+ * 先 =try= 後 =do=
+   1. 首先做一次 try acquire 嘗試, 在 exclusive 下是 =tryAcquire=, 在 shared 下是 =tryAcquireShared=
+   2. try acquire 失敗, 進入 =do= 方法自旋, 在 exclusive 下是 =doAcquire=, 在 shared 下是 =doAcquireShared=
+#+begin_src java
+    public final void acquire(int arg) {
+        if (!tryAcquire(arg))
+            doAcquire(arg);
+    }
+
+    public final void acquireShared(int arg) {
+        if (tryAcquireShared(arg) < 0)
+            doAcquireShared(arg);
+    }
+#+end_src
+ * do acquire 負責 *自旋* 與 sync queue 的維護
+#+begin_src java
+    private void doAcquire(int arg) {
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    if (interrupted)
+                        selfInterrupt();
+                    failed = false;
+                    return;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    interrupted = true;
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    private void doAcquireShared(int arg) {
+        final Node node = addWaiter(Node.SHARED);
+        boolean failed = true;
+        try {
+            boolean interrupted = false;
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    if (r >= 0) {
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        if (interrupted)
+                            selfInterrupt();
+                        failed = false;
+                        return;
+                    }
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    interrupted = true;
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+#+end_src
+** 立即響應 interrupt 的 acquire
+ * 先 =try= 後 =do=
+   1. 首先先檢查是否已經被 interrupt, 如果是則立即 throw =InterruptedException=
+   2. 做一次 try acquire 嘗試, 在 exclusive 下是 =tryAcquire=; 在 shared 下是 =tryAcquireShared=
+   3. try acquire 失敗, 進入 =do= 方法自旋, 在 exclusive 下是 =doAcquireInterruptibly=; 在 shared 下是 =doAcquireSharedInterruptibly=
+#+begin_src java
+    public final void acquireInterruptibly(int arg)
+            throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        if (!tryAcquire(arg))
+            doAcquireInterruptibly(arg);
+    }
+
+    public final void acquireSharedInterruptibly(int arg)
+            throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        if (tryAcquireShared(arg) < 0)
+            doAcquireSharedInterruptibly(arg);
+    }
+#+end_src
+ * do acquire 負責 *自旋* 與 sync queue 的維護
+#+begin_src java
+    private void doAcquireInterruptibly(int arg)
+        throws InterruptedException {
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    failed = false;
+                    return;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    private void doAcquireSharedInterruptibly(int arg)
+        throws InterruptedException {
+        final Node node = addWaiter(Node.SHARED);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    if (r >= 0) {
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        failed = false;
+                        return;
+                    }
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+#+end_src
+** 帶有 timeout 的 acquire
+ * 先 =try= 後 =do=
+   1. 首先先檢查是否已經被 interrupt, 如果是則立即 throw =InterruptedException=
+   2. 做一次 try acquire 嘗試, 在 exclusive 下是 =tryAcquireNanos=; 在 shared 下是 =tryAcquireSharedNanos=
+   3. try acquire 失敗, 進入 =do= 方法自旋, 在 exclusive 下是 =doAcquireNanos=; 在 shared 下是 =doAcquireSharedNanos=
+#+begin_src java
+    public final boolean tryAcquireNanos(int arg, long nanosTimeout)
+            throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        return tryAcquire(arg) ||
+            doAcquireNanos(arg, nanosTimeout);
+    }
+
+    public final boolean tryAcquireSharedNanos(int arg, long nanosTimeout)
+            throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        return tryAcquireShared(arg) >= 0 ||
+            doAcquireSharedNanos(arg, nanosTimeout);
+    }
+
+#+end_src
+ * do acquire 負責 *自旋* 與 sync queue 的維護
+#+begin_src java
+    private boolean doAcquireNanos(int arg, long nanosTimeout)
+            throws InterruptedException {
+        if (nanosTimeout <= 0L)
+            return false;
+        final long deadline = System.nanoTime() + nanosTimeout;
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null; // help GC
+                    failed = false;
+                    return true;
+                }
+                nanosTimeout = deadline - System.nanoTime();
+                if (nanosTimeout <= 0L)
+                    return false;
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    nanosTimeout > spinForTimeoutThreshold)
+                    LockSupport.parkNanos(this, nanosTimeout);
+                if (Thread.interrupted())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+    private boolean doAcquireSharedNanos(int arg, long nanosTimeout)
+            throws InterruptedException {
+        if (nanosTimeout <= 0L)
+            return false;
+        final long deadline = System.nanoTime() + nanosTimeout;
+        final Node node = addWaiter(Node.SHARED);
+        boolean failed = true;
+        try {
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    if (r >= 0) {
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        failed = false;
+                        return true;
+                    }
+                }
+                nanosTimeout = deadline - System.nanoTime();
+                if (nanosTimeout <= 0L)
+                    return false;
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    nanosTimeout > spinForTimeoutThreshold)
+                    LockSupport.parkNanos(this, nanosTimeout);
+                if (Thread.interrupted())
+                    throw new InterruptedException();
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+#+end_src
+** release
+ * 先 =try= 後 =do=
+   1. 首先執行 try relese 方法, 對 =state= 進行撤銷操作, 在 exclusive 下是 =tryRelease=, 在 shared 下是 =tryReleaseShared=
+   2. 根據 try release 方法的 return 決定是否調用 =do= release 方法, 對 sync queue 進行維護
+#+begin_src java
+    public final boolean release(int arg) {
+        if (tryRelease(arg)) {
+            doRelease();
+            return true;
+        }
+        return false;
+    }
+
+    public final boolean releaseShared(int arg) {
+        if (tryReleaseShared(arg)) {
+            doReleaseShared();
+            return true;
+        }
+        return false;
+    }
+#+end_src
+ * do release 方法負責對 sync queue 的維護
+#+begin_src java
+    private void doRelease() {
+        Node h = head;
+        if(h != null && h.waitStatus != 0)
+            unparkSuccessor(h);
+    }
+
+    private void doReleaseShared() {
+        for (;;) {
+            Node h = head;
+            if (h != null && h != tail) {
+                int ws = h.waitStatus;
+                if (ws == Node.SIGNAL) {
+                    if (!compareAndSetWaitStatus(h, Node.SIGNAL, 0))
+                        continue;            // loop to recheck cases
+                    unparkSuccessor(h);
+                }
+                else if (ws == 0 &&
+                         !compareAndSetWaitStatus(h, 0, Node.PROPAGATE))
+                    continue;                // loop on failed CAS
+            }
+            if (h == head)                   // loop if head changed
+                break;
+        }
+    }
+
+#+end_src

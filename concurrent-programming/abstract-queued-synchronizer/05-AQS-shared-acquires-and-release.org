@@ -1,0 +1,197 @@
+#+TITLE: AQS shared acquires and release
+經過 AQS 重構的章節, 我們發現無論是 exclusive/shared 下, 所有不同功能的 acquires/release 都有完全相同的結構、流程、風格以及職責劃分:
+ * 所有的 acquire/release 先 =try=, 後 =do=
+ * 所有的 =try= 方法不涉及對 sync queue 的維護
+ * 所有的 =do= 方法涉及對 sync queue 的維護
+#+begin_src java
+    /**
+     * Acquires in shared mode, ignoring interrupts.  Implemented by
+     * first invoking at least once {@link #tryAcquireShared},
+     * returning on success.  Otherwise the thread is queued, possibly
+     * repeatedly blocking and unblocking, invoking {@link
+     * #tryAcquireShared} until success.
+     *
+     * @param arg the acquire argument.  This value is conveyed to
+     *        {@link #tryAcquireShared} but is otherwise uninterpreted
+     *        and can represent anything you like.
+     */
+    public final void acquireShared(int arg) {
+        if (tryAcquireShared(arg) < 0)
+            doAcquireShared(arg);
+    }
+
+#+end_src
+
+exclusive/shared 的 acquires/release 最主要的差異在於對 sync queue 維護的不同。 在 shared 下, 如果一個 thread 成功 acquire, 不一定會使其他 thread acquire 失敗; 而當一個已經在 sync queue 中 park 自旋的 thread 如果成功 acquire 了, 也可能代表有一系列依賴相同狀態的 thread 要 acquire 成功。
+
+體現到代碼的差異來看, exclusive/shared 有以下不同:
+ * shared 下, try acquire 方法 return =int=
+ * shared 下, do acquire 方法調用 =addWaiter= 時, 傳入 =Node.SHARED=
+ * shared 下, do acquire 方法調用 =setHeadAndPropagate(node, arg)=
+ * shared 下, do release 方法有更多額外的操作, 並且被 =releaseShared(arg)= 和 =setHeadAndPropagate(node, arg)= 依賴
+* tryAcquireShared(arg)
+#+begin_src java
+    /**
+     * Attempts to acquire in shared mode. This method should query if
+     * the state of the object permits it to be acquired in the shared
+     * mode, and if so to acquire it.
+     *
+     * <p>This method is always invoked by the thread performing
+     * acquire.  If this method reports failure, the acquire method
+     * may queue the thread, if it is not already queued, until it is
+     * signalled by a release from some other thread.
+     *
+     * <p>The default implementation throws {@link
+     * UnsupportedOperationException}.
+     *
+     * @param arg the acquire argument. This value is always the one
+     *        passed to an acquire method, or is the value saved on entry
+     *        to a condition wait.  The value is otherwise uninterpreted
+     *        and can represent anything you like.
+     * @return a negative value on failure; zero if acquisition in shared
+     *         mode succeeded but no subsequent shared-mode acquire can
+     *         succeed; and a positive value if acquisition in shared
+     *         mode succeeded and subsequent shared-mode acquires might
+     *         also succeed, in which case a subsequent waiting thread
+     *         must check availability. (Support for three different
+     *         return values enables this method to be used in contexts
+     *         where acquires only sometimes act exclusively.)  Upon
+     *         success, this object has been acquired.
+     * @throws IllegalMonitorStateException if acquiring would place this
+     *         synchronizer in an illegal state. This exception must be
+     *         thrown in a consistent fashion for synchronization to work
+     *         correctly.
+     * @throws UnsupportedOperationException if shared mode is not supported
+     */
+    protected int tryAcquireShared(int arg) {
+        throw new UnsupportedOperationException();
+    }
+#+end_src
+=tryAcquireShared= 同樣由 subclass 負責實現, 只涉及對 =state= 的修改, 以 return 一個 =int= 表示 =tryAcquireShared(arg)= 的成功或失敗, 並且有很強的規範:
+ * 當 return < 0 時, 表示 =tryAcquireShared= 失敗了, 接下來必須涉及對 sync queue 的維護, 也就是必須進入 =doAcquireShared=
+ * 當 return = 0 時, 表示 =tryAcquireShared= 成功了, 但這是最初使的狀態, 還沒有其他 =tryAcquireShared= 發生
+ * 當 return > 0 時, 表示 =tryAcquireShared= 成功了, 表且後續到來的 =tryAcquireShared= 也都會成功
+
+=tryAcquireShared= 應該這樣理解, 當 acquireShared 執行 =tryAcquireShared= 到發現需要被阻塞時, 完成自己的職責後 return 一個 negative 的值, 跳出 =tryAcquireShared= 讓 =doAcquireShared= 接手完成 =addWaiter= 並進入 park 的工作。
+* doAcquireShared(arg)
+#+begin_src java
+    /**
+     * Acquires in shared uninterruptible mode.
+     * @param arg the acquire argument
+     */
+    private void doAcquireShared(int arg) {
+        final Node node = addWaiter(Node.SHARED);
+        boolean failed = true;
+        try {
+            boolean interrupted = false;
+            for (;;) {
+                final Node p = node.predecessor();
+                if (p == head) {
+                    int r = tryAcquireShared(arg);
+                    if (r >= 0) {
+                        setHeadAndPropagate(node, r);
+                        p.next = null; // help GC
+                        if (interrupted)
+                            selfInterrupt();
+                        failed = false;
+                        return;
+                    }
+                }
+                if (shouldParkAfterFailedAcquire(p, node) &&
+                    parkAndCheckInterrupt())
+                    interrupted = true;
+            }
+        } finally {
+            if (failed)
+                cancelAcquire(node);
+        }
+    }
+
+#+end_src
+我們可以看到, =doAcquireShared= 的不同體現在兩個方面:
+1. =node= 進入 sync queue 時, 調用 =addWaiter(node)= 是傳入 =Node.SHARED=
+2. =node= 離開 sync queue 時, 調用 =setHeadAndPropagate(node, r)=
+** setHeadAndPropagate(node, arg)
+其實主要區別就在於, =node= 從 sync queue 的 =head= 離開時, 需要確保這個操作能被 propagate 下去, 進行一連串的釋放:
+#+begin_src java
+    /**
+     * Sets head of queue, and checks if successor may be waiting
+     * in shared mode, if so propagating if either propagate > 0 or
+     * PROPAGATE status was set.
+     *
+     * @param node the node
+     * @param propagate the return value from a tryAcquireShared
+     */
+    private void setHeadAndPropagate(Node node, int propagate) {
+        Node h = head; // Record old head for check below
+        setHead(node);
+        /*
+         * Try to signal next queued node if:
+         *   Propagation was indicated by caller,
+         *     or was recorded (as h.waitStatus either before
+         *     or after setHead) by a previous operation
+         *     (note: this uses sign-check of waitStatus because
+         *      PROPAGATE status may transition to SIGNAL.)
+         * and
+         *   The next node is waiting in shared mode,
+         *     or we don't know, because it appears null
+         *
+         * The conservatism in both of these checks may cause
+         * unnecessary wake-ups, but only when there are multiple
+         * racing acquires/releases, so most need signals now or soon
+         * anyway.
+         */
+        if (propagate > 0 || h == null || h.waitStatus < 0 ||
+            (h = head) == null || h.waitStatus < 0) {
+            Node s = node.next;
+            if (s == null || s.isShared())
+                doReleaseShared();
+        }
+    }
+
+#+end_src
+我們在這裡先記住, =doReleaseShared()= 只是從 =head= 開始進行一連串的 unpark 操作。 為了確保 unpark 必定可以 propagate 下去, 要考慮到競爭極端激烈的情況: 在 propagate 過程中有可能因為 =cancelAcquire= 觸發, 並且 =node= 可能是當時的 =tail= 而被 =null=; 此時有新的 =node= 成為了 =tail=, 但是 =h= 或 =head= 或是 =next= 尚未更新前, 有可能都是呈現 =null= 的狀態, 也就是理論上這個 unpark 應該被 propagate 下去但卻因為某些情況中斷。 總之, propagate 過程中鎖涉及的所有相關的 =node= 突然被 =null= 掉, 都代表 propagate 需要繼續 propagate 下去:
+1. 傳進來的 =propagate= > 0
+2. =prev= 準備被移出 sync queue, 但卻意外的被 =null= 掉
+3. =prev= 沒被意外的 =null= 掉, 但 =prev.waitStatus= < 0, 說明 =successor= 需要被 unpark
+4. =head= 發生變化, 不再是 =node= 自己, 卻意外被 =null= 掉
+5. =head= 發生變化, 不再是 =node= 自己, 沒意外被 =null= 掉, 但 =h.waitStatus= < 0, 說明 =h.successor= 需要被 unpark
+* doReleaseShared()
+=doReleaseShared()= 雖然只是從 =head= 開始進行一連串的 unpark 操作, 但要注意: =doReleaseShared()= 執行過程中, 隨時有可能因後面的 =node= 發失改變, 而導致 unpark 錯誤的對象, 所以 =doReleaseShared()= 要以 CAS 的方式對 =head.waitStatus= 進行修改, 這是在確保這個修改過程是原子的, 過程中不會被其他線程切換而導致 =unparkSuccessor(h)= unpark 已經不再是正確的 =successor= 。 同樣的, 當 =h.waitStatus= = =0= 時, 也要 CAS 直到將 =head.waitStatus= 設置為 =PROPAGATE= 為止, 以確保 =doReleaseShared()= 沒有任何遺漏。
+#+begin_src java
+    private void doReleaseShared() {
+        /*
+         * Ensure that a release propagates, even if there are other
+         * in-progress acquires/releases.  This proceeds in the usual
+         * way of trying to unparkSuccessor of head if it needs
+         * signal. But if it does not, status is set to PROPAGATE to
+         * ensure that upon release, propagation continues.
+         * Additionally, we must loop in case a new node is added
+         * while we are doing this. Also, unlike other uses of
+         * unparkSuccessor, we need to know if CAS to reset status
+         * fails, if so rechecking.
+         */
+        for (;;) {
+            Node h = head;
+            if (h != null && h != tail) {
+                int ws = h.waitStatus;
+                if (ws == Node.SIGNAL) {
+                    if (!compareAndSetWaitStatus(h, Node.SIGNAL, 0))
+                        continue;            // loop to recheck cases
+                    unparkSuccessor(h);
+                }
+                else if (ws == 0 &&
+                         !compareAndSetWaitStatus(h, 0, Node.PROPAGATE))
+                    continue;                // loop on failed CAS
+            }
+            if (h == head)                   // loop if head changed
+                break;
+        }
+    }
+#+end_src
+最後, 注意最後一個 =if= 是 while loop 的中止條件, 這個條件成立有三種可能:
+1. =head= 是, 或已經是 =null=
+2. =head= 是, 或已經是 =tail=
+3. =head.waitStatus= 是, 或已經是 =PROPAGATE=
+* shared acquires 和 release 的總結
+我們可以發現, exclusive 下對 sync queue 的維護相比之下比較隨意, 因為 exclusive 下如果 =tryAcquire(arg)= 成功而執行 =setHead(node)= 是安全的, 因為 =tryAcquire(arg)= 的成功依賴於 =arg= = =state= 成立的條件上, 而 =state= 是 volatile 的, 並且每次只會對 =head= 做一次 =unparkSuccessor(h)= 操作; 而 shared 下對 sync queue 的維護就顯得謹慎許多, 因為 shared 下的 =releaseShared= 需要 release 一連串的 =node=, 過程中必須確保級便有新的 =node= 進到 sync queue 或是有 =node= 被 cancel 也不會出錯。

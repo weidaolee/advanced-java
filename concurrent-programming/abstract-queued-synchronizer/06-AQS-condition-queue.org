@@ -1,0 +1,575 @@
+#+TITLE: AQS Condition Queue
+=Condition= 是 JUC 為提供與 Java 隱式鎖 Monitor 中的 Wait-Notify 相似的、用於線程間通信的機制, 這個機制與隱式鎖的 Wait-Notify 機制有以下幾個不同點:
+1. =Condition= 是 JUC 實現的, 而 Java 隱式鎖的 Wait-Notify 是由底層 JVM 實現
+2. =Condition= 的方法 await/signal 是 =Condition= 的方法, Java 隱式鎖的 wait/notify 是 =Object= 的方法
+3. =Condition= 是 AQS 線程同步技術通用的, Java 隱式鎖的 Wait-Notify 只能用於互斥/悲觀鎖
+4. =Condition= 可以提供多個 condition queue, 而 Java 隱式鎖的 Wait-Notify 只能提供一個
+5. =Condition= 可以支持立即響應異常、 timeout 響應異常, Java 隱式鎖的 Wait-Notify 只能等到成功上鎖後響應
+
+=ConditionObject= 是在 AQS 中的內部靜態類, 是 =Condition= 在 JUC 的 concrete class 實現, 每一個 =ConditionObject= instance 就對應一個 condition queue, 是一個單向的 linked list 結構。
+* ConditionObject 核心成員變量
+=ConditionObject= 有以下核心成員變量, 用於紀錄 condition queue 的第一個 =Node= 和最後的 =Node=:
+#+begin_src java
+    public class ConditionObject implements Condition, java.io.Serializable {
+        /** First node of condition queue. */
+        private transient Node firstWaiter;
+        /** Last node of condition queue. */
+        private transient Node lastWaiter;
+    }
+#+end_src
+並且這些在 condition queue 的 =Node=, 是依靠 =Node= 中的 =nextWaiter= link 在一起, 這個 =nextWaiter= 在當 =Node= 處在 sync queue 中時是冗餘的, AQS 利用了這個冗餘性, 將 =nextWaiter= 用於標記 =Node= 是以 exclusive/shared 來 acquire/release AQS 的 sync queue。 以下是 sync queue 和 condition queue 之間的關係示意圖:
+[[./image/sync-queue-and-condition-queue.png]]
+* AQS 中的 transfer 方法
+AQS 中有兩個 =transfer= 方法, 用於將處於 condition queue 的 =node=, 在被喚醒後需要被 transfer 回 sync queue 中, 這種喚醒有兩種:
+ * 被 signal/signalAll
+ * 被 interrupt
+** transferForSignal(node)
+當一個 =node= 從 condition queue 中 await, 如果被 signal 而要轉移到 sync queue 中時, 會調用 =transferForSignal(node)= 方法, 這個方法有以下重點:
+1. 如果首先將 =node.waitStatus= 以 CAS 方式改為 =0= 失敗時, 代表此次 transfer 失敗
+2. 調用 =enq(node)= 將 =node= 以 CAS 自旋的方式加到 sync queue 中
+3. 以 =p= 接收 =enq(node)= 的 return, 注意這個 return 會是成功 =enq(node)= 的 =node.prev=
+4. 將 =p.waitStatus= 以 CAS 方式改為 =SIGNAL=, 這一步如果失敗則將 =node.thread= 立刻 unpark, 讓 =node.thread= 根據自身的位置來決定是否要繼續 park 自旋
+#+begin_src java
+    /**
+     * Transfers a node from a condition queue onto sync queue.
+     * Returns true if successful.
+     * @param node the node
+     * @return true if successfully transferred (else the node was
+     * cancelled before signal)
+     */
+    final boolean transferForSignal(Node node) {
+        /*
+         * If cannot change waitStatus, the node has been cancelled.
+         */
+        if (!compareAndSetWaitStatus(node, Node.CONDITION, 0))
+            return false;
+
+        /*
+         * Splice onto queue and try to set waitStatus of predecessor to
+         * indicate that thread is (probably) waiting. If cancelled or
+         * attempt to set waitStatus fails, wake up to resync (in which
+         * case the waitStatus can be transiently and harmlessly wrong).
+         */
+        Node p = enq(node);
+        int ws = p.waitStatus;
+        if (ws > 0 || !compareAndSetWaitStatus(p, ws, Node.SIGNAL))
+            LockSupport.unpark(node.thread);
+        return true;
+    }
+#+end_src
+注意, 透過這種方法從 condition queue 中離開而進入 sync queue 中的 =node=, 自進入 condition queue 並離開, 且又進入 sync queue 後都沒有被解除 park 的狀態, 直到在 sync queue 中被 unpark 才會進入該 await 實現的 =acquireQueued(node, savedState)= 自旋
+** transferAfterCancelledWait(node)
+當一個 =node= 從 condition queue 中 await, 在兩種情況下進入 sync queue 時, 會是已經解除 park 的狀態:
+1. await 版本允許響應 interrupt, 並且收到 interrupt
+   此時進入 sync queue 後立刻進入 await 鎖實現的 =acquireQueued(node, savedState)= 自旋
+2. await 版本支持 timeout, 並且 timeout
+   此時進入 sync queue 後立刻進入 await 鎖實現的 =acquireQueued(node, savedState)= 自旋
+
+在以上這兩種情況會需要調用 =transferAfterCancelledWait(node)= 方法, 這個方法有以下重點:
+1. 只要該方法執行有 return, 都代表 =node= 已經在 sync queue 中
+2. 兩種不同結果的 return 只用於區別進入 sync queue 是因為 timeout 導致的還是因為 interrupt 導致的
+#+begin_src java
+    /**
+     * Transfers node, if necessary, to sync queue after a cancelled wait.
+     * Returns true if thread was cancelled before being signalled.
+     *
+     * @param node the node
+     * @return true if cancelled before the node was signalled
+     */
+    final boolean transferAfterCancelledWait(Node node) {
+        if (compareAndSetWaitStatus(node, Node.CONDITION, 0)) {
+            enq(node);
+            return true;
+        }
+        /*
+         * If we lost out to a signal(), then we can't proceed
+         * until it finishes its enq().  Cancelling during an
+         * incomplete transfer is both rare and transient, so just
+         * spin.
+         */
+        while (!isOnSyncQueue(node))
+            Thread.yield();
+        return false;
+    }
+#+end_src
+* await/signal 依賴的方法
+在討論 await/signal 的方法前, 我們先詳細討論 await/signal 會依賴的通用方法, 在討論 await/signal 方法時會比較好理解。
+
+注意, =ConditionObject= 中的方法如果不涉及對 sync queue 的操作, 通常代表調用該方法時 thread 已經處在 =tryAcquire= 方法執行成功的狀態下, 此時由於只會有 acquire 成功的 thread 可以對 condition queue 操作, 因此即便不需要 CAS 和 volatile 的保護, 這些操作都是線程安全的, 不需要像維護 sync queue 一樣需要考慮競爭場景。
+** addConditionWaiter()
+=addConditionWaiter()= 的作用類似於 sync queue 中的 =addWaiter(node)= 類似, 也就是將 thread 封裝到 =Node= 中並加到 condition queue 的 =lastWaiter=, 其實現思路如下: 確保 =lastWaiter= 是沒有被 cancelled 的 =Node=, 然後將 =Node= link 在 =lastWaiter= 之後。
+#+begin_src java
+    /**
+     * Adds a new waiter to sync queue.
+     * @return its new wait node
+     */
+    private Node addConditionWaiter() {
+        Node t = lastWaiter;
+        // If lastWaiter is cancelled, clean out.
+        if (t != null && t.waitStatus != Node.CONDITION) {
+            unlinkCancelledWaiters();
+            t = lastWaiter;
+        }
+        Node node = new Node(Thread.currentThread(), Node.CONDITION);
+        if (t == null)
+            firstWaiter = node;
+        else
+            t.nextWaiter = node;
+        lastWaiter = node;
+        return node;
+    }
+
+#+end_src
+注意, 所有調用 =addConditionWaiter()= 的線程, 都是已經 =tryAcquire= 成功的線程, 並且過程中只涉及對 condition queue 的操作。
+** unlinkCancelledWaiters()
+=unlinkCancelledWaiters()= 會將整個 condition queue 中所有被 cancelled 的 =Node= 都清除掉, 它的實現有以下重點:
+1. 是從 =firstWaiter= 一直往後找 =nextWaiter= 直到為 =null= 為止
+   也就是說在這一步是確認了所有處在 condition queue 中的 =node= 的狀態
+2. 確認過程中, 是檢查 =waitStatus= 是否為 =CONDITION=, 所有其他不是的都會被移出 condition queue
+   注意, =CANCELLED= 狀態可能發生在 sync queue, 也可能發生在 condition queue, 但其他狀態都是 sync queue 中的 =node= 才會有的狀態; 只要不是 =CONDITION= 都一併移出
+#+begin_src java
+    /**
+     * Unlinks cancelled waiter nodes from condition queue.
+     * Called only while holding lock. This is called when
+     * cancellation occurred during condition wait, and upon
+     * insertion of a new waiter when lastWaiter is seen to have
+     * been cancelled. This method is needed to avoid garbage
+     * retention in the absence of signals. So even though it may
+     * require a full traversal, it comes into play only when
+     * timeouts or cancellations occur in the absence of
+     * signals. It traverses all nodes rather than stopping at a
+     * particular target to unlink all pointers to garbage nodes
+     * without requiring many re-traversals during cancellation
+     * storms.
+     */
+    private void unlinkCancelledWaiters() {
+        Node t = firstWaiter;
+        Node trail = null;
+        while (t != null) {
+            Node next = t.nextWaiter;
+            if (t.waitStatus != Node.CONDITION) {
+                t.nextWaiter = null;
+                if (trail == null)
+                    firstWaiter = next;
+                else
+                    trail.nextWaiter = next;
+                if (next == null)
+                    lastWaiter = trail;
+            }
+            else
+                trail = t;
+            t = next;
+        }
+    }
+
+#+end_src
+這裡採取的的策略是: 只要發現有一個 =node= 需要從 condition queue 被移出, 就 traverse 每一個在 condition queue 中所有的 =node= 把需要被移出的 =node= 都移出。 這是由於 condition queue 是單向的, 所以當每次只移出一個 cancelled 的 =node= 時, 如果有 =N= 個 =node= 被 cancelled 就需要執行 =N= 次的 traverse 才能定位到 prev 和 next 以做 re-link, 還不如一次性對所有 =node= 做檢查。
+** checkInterruptWhileWaiting(node)
+執行 =checkInterruptWhileWaiting(node)= 時, 代表該線程已經處在 condition queue 中等待, 而做 =checkInterruptWhileWaiting= 的檢查時, 如果檢查結果是 *沒有被 interrupt*, 會直接 return =0=; 而如果是 *有被 interrupt*, 則一定會執行 =transferAfterCancelledWait(node)=, 這代表如果 *有被 interrupt*, 執行 =checkInterruptWhileWaiting(node)= 後這個 =node= 會脫離 condition queue 的控制, 被轉移到 sync queue 中, 交給 sync queue 的規則來響應 interrupt:
+#+begin_src java
+    /** Mode meaning to reinterrupt on exit from wait */
+    private static final int REINTERRUPT =  1;
+    /** Mode meaning to throw InterruptedException on exit from wait */
+    private static final int THROW_IE    = -1;
+
+
+    /**
+     * Checks for interrupt, returning THROW_IE if interrupted
+     * before signalled, REINTERRUPT if after signalled, or
+     * 0 if not interrupted.
+     */
+    private int checkInterruptWhileWaiting(Node node) {
+        return Thread.interrupted() ?
+            (transferAfterCancelledWait(node) ? THROW_IE : REINTERRUPT) :
+            0;
+    }
+#+end_src
+** reportInterruptAfterWait(node)
+這個方法會根據傳入的 =interruptMode= 來決定如何響應:
+#+begin_src java
+    /**
+     * Throws InterruptedException, reinterrupts current thread, or
+     * does nothing, depending on mode.
+     */
+    private void reportInterruptAfterWait(int interruptMode)
+        throws InterruptedException {
+        if (interruptMode == THROW_IE)
+            throw new InterruptedException();
+        else if (interruptMode == REINTERRUPT)
+            selfInterrupt();
+    }
+#+end_src
+* await 系列方法
+await 系列方法是與 Java 隱式鎖對應的 =wait()= 方法, 能夠執行該方法有一個重要的前提: 該線程處於 =try= acquire 成功的狀態, 正在臨界區內準備執行臨界區代碼, 但因為一個給定的不成立, 必須 release 掉這次成功的 acquire, 並進入該 condition queue 中等待一個 signal; 如果收到 signal, 則重新進入 wait queue, 而如果是由於收到 interrupt 被喚醒, 則依照各種 await 版本做相應的處裡。
+
+另外, 該線程執行完 await 系列方法之後, =node= 的狀態如下:
+ * =node= 必不處於 sync queue 中
+ * =node.waitStatus= 為 =CONDITION=
+ * =node.thread= 必處於 park
+
+執行的流程如下:
+1. 將 thread 加到 condition queue 中
+2. 徹底讓出 sync queue 所有權
+3. 在 condition queue 中等待 signal 或 interrupt
+4. 根據收到 signal 或 interrupt, 決定是否要重新進入 sync queue
+
+執行的流程對應的實現如下:
+1. 調用 =addConditionWaiter()=
+   這是一個 =ConditionObject= 的方法, 調用後會將當前 thread 加到 =lastWaiter= 之後
+2. 執行 =fullyRelease(node)=
+   由於是因為條件不滿足, 而需要完全讓出 sync 的所有權, 所以必須將 =state= 完全還原到最初使的狀態, 讓其他 thread 可以 acquire 成功, 否則就不是完全的讓出所有權
+3. 進入 condition queue 中 park 等待
+   在 =node= 進入 condition queue 後, 必不在 sync queue 中, 此時會以 =while(!isOnSyncQueue(node))= 確保 =node= 只要不在 sync queue 內就進入 park, 除非是會響應 interrupt 的 await, 否則必須等到 =node= 被轉移到 sync queue 中才能解除這個狀態。
+4. 離開 condition queue 進入 sync queue 中進行 =acquireQueued= 自旋
+   在剛進入 sync queue 時, =node.thread= 還處於 while loop 中。 當 =node= 是因為被 signal 方法轉移到 sync queue 時, =node.thread= 只有等到 =node.prev= 執行了 =unparkSuccessor(node)= 才能被喚醒並進入 =acquireQueued= 自旋; 而如果 =node= 是因為 await 是有支持響應 interrupt 或是 timeout 的版本, 而直接 break 離開 while 進入 =acquireQueued= 自旋 。
+
+await 系列方法有:
+- [[awaitUninterruptibly()][awaitUninterruptibly()]]
+- [[await()][await()]]
+- [[await(time, unit)][await(time, unit)]]
+- [[awaitNanos(nanosTimeout)][awaitNanos(nanosTimeout)]]
+- [[awaitUntil(deadline)][awaitUntil(deadline)]]
+** awaitUninterruptibly()
+推遲響應 interrupt 的 await 方法, 在 condition queue 中被喚醒只修改 =interrupted = true= 後重新進入 park, 只有 =node= 被 signal 而重新被加入為 sync queue 中的 =node= 時, 才能根據 while 自旋的條件離開 while loop, 並且離開後會執行 =acquireQueued(node, savedState)=, 直到成功為止。
+#+begin_src java
+    /**
+     * Implements uninterruptible condition wait.
+     * <ol>
+     * <li> Save lock state returned by {@link #getState}.
+     * <li> Invoke {@link #release} with saved state as argument,
+     *      throwing IllegalMonitorStateException if it fails.
+     * <li> Block until signalled.
+     * <li> Reacquire by invoking specialized version of
+     *      {@link #acquire} with saved state as argument.
+     * </ol>
+     */
+    public final void awaitUninterruptibly() {
+        Node node = addConditionWaiter();
+        int savedState = fullyRelease(node);
+        boolean interrupted = false;
+        while (!isOnSyncQueue(node)) {
+            LockSupport.park(this);
+            if (Thread.interrupted())
+                interrupted = true;
+        }
+        if (acquireQueued(node, savedState) || interrupted)
+            selfInterrupt();
+    }
+
+#+end_src
+** await()
+立即響應 interrupt 的 await 方法, 這個方法會首先檢查是否已經被 interrupt, 如果是的話會立刻 throw =InterruptedException= 直接響應; 如果不是的話, 則是立即讓處在 condition queue 中 await 的 =node= 在收到 interrupt 後, 立刻脫離 condition queue 進入 sync queue 中進行 =acquireQueued(node, savedState)= 自旋。
+
+這種 await 版本有兩種離開 while loop 的方式, 一種是透過與 =awaitUninterruptibly()= 相同的方式, 也就是被 signal 後回到 sync queue, 然後在 sync queue 中被 unpark, 並由於已經處在 sync queue 中而離開 while loop; 另一種是透過被 interrupt, 當 interrupt 發生時, 會執行 =checkInterruptWhileWaiting(node)=, 該方法內部會調用 =transferAfterCancelledWait(node)=, 這個方法只要有 return 都已經確保該 =node= 已經在 sync queue 內, 此時起到離開 while loop 作用的是 =break=
+#+begin_src java
+    /**
+     * Implements interruptible condition wait.
+     * <ol>
+     * <li> If current thread is interrupted, throw InterruptedException.
+     * <li> Save lock state returned by {@link #getState}.
+     * <li> Invoke {@link #release} with saved state as argument,
+     *      throwing IllegalMonitorStateException if it fails.
+     * <li> Block until signalled or interrupted.
+     * <li> Reacquire by invoking specialized version of
+     *      {@link #acquire} with saved state as argument.
+     * <li> If interrupted while blocked in step 4, throw InterruptedException.
+     * </ol>
+     */
+    public final void await() throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        Node node = addConditionWaiter();
+        int savedState = fullyRelease(node);
+        int interruptMode = 0;
+        while (!isOnSyncQueue(node)) {
+            LockSupport.park(this);
+            if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+                break;
+        }
+        if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+            interruptMode = REINTERRUPT;
+        if (node.nextWaiter != null) // clean up if cancelled
+            unlinkCancelledWaiters();
+        if (interruptMode != 0)
+            reportInterruptAfterWait(interruptMode);
+    }
+#+end_src
+無論以哪一種方式離開, 都會進入 =acquireQueued(node, savedState)= 自旋, 直到 acquire 成功後才能繼續往下執行。 注意, 一個 =node= 無論是在 condition queue 收到 interrupt, 還是在重新進入 sync queue 後收到 interrupt, 只要有收到 interrupt 在最終 acquire 時都必須響應 interrupt, 但響應的模式有所不同: 如果只有在 condition queue 被 interrupt, 而 =acquireQueued= 自旋過程中沒有被 interrupt 則以 =THROW_IE= 這種模式 throw =InterruptedException=; 而如果有在 =acquireQueued= 自旋過程中收到 interrupt, 無論在 condition queue 有沒有被 interrupt, 都以 =selfInterrupt()= 的方式響應 interrupt; 最後, 如果都沒有發生 interrupt, 說明這是透過 signal 正常離開 condition queue 而進入 sync queue, 並且最後 =acquireQueued= 成功都沒有被 interrupt, 應該正常執行臨界區代碼。
+** await(time, unit)
+帶有 timeout 功能的 await 方法, 在立即響應的 await 方法之上多增加了 timeout 機制。 有第三種離開 while 的方式: 如果由於 =LockSupport.parkNanos(this, nanosTimeout)= 因為時間到了而自動醒來, 會因為 while loop 最後一行執行 =nanosTimeout = deadline - System.nanoTime()= 後使 =nanosTimeout= 小於 =0=, 這樣在重新進入 while loop 後會因為第一個 =if= 而 break 離開 while loop, 並繼續往下執行。
+
+注意, 這種 await 版本會 return =!timedout= 表示是否因為 timeout 而離開 condition queue, 並且要注意: 以 timeout 方式離開 condition queue 的 =node= 並不是被 interrupt, 所以在進入 sync queue 後如果也沒有收到 interrupt, 在最後 =acquireQueued(node, savedState)= 成功後可以正常進入臨界區執行, 這個 timeout 只表示在 condition queue 中等待的時間, 而非在 sync queue 中等待的時間。
+#+begin_src java
+    /**
+     * Implements timed condition wait.
+     * <ol>
+     * <li> If current thread is interrupted, throw InterruptedException.
+     * <li> Save lock state returned by {@link #getState}.
+     * <li> Invoke {@link #release} with saved state as argument,
+     *      throwing IllegalMonitorStateException if it fails.
+     * <li> Block until signalled, interrupted, or timed out.
+     * <li> Reacquire by invoking specialized version of
+     *      {@link #acquire} with saved state as argument.
+     * <li> If interrupted while blocked in step 4, throw InterruptedException.
+     * <li> If timed out while blocked in step 4, return false, else true.
+     * </ol>
+     */
+
+    public final boolean await(long time, TimeUnit unit)
+            throws InterruptedException {
+        long nanosTimeout = unit.toNanos(time);
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        Node node = addConditionWaiter();
+        int savedState = fullyRelease(node);
+        final long deadline = System.nanoTime() + nanosTimeout;
+        boolean timedout = false;
+        int interruptMode = 0;
+        while (!isOnSyncQueue(node)) {
+            if (nanosTimeout <= 0L) {
+                timedout = transferAfterCancelledWait(node);
+                break;
+            }
+            if (nanosTimeout >= spinForTimeoutThreshold)
+                LockSupport.parkNanos(this, nanosTimeout);
+            if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+                break;
+            nanosTimeout = deadline - System.nanoTime();
+        }
+        if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+            interruptMode = REINTERRUPT;
+        if (node.nextWaiter != null)
+            unlinkCancelledWaiters();
+        if (interruptMode != 0)
+            reportInterruptAfterWait(interruptMode);
+        return !timedout;
+    }
+
+#+end_src
+** awaitNanos(nanosTimeout)
+=awaitNanos(nanosTimeout)= 和 =await(time, unit)= 只在兩個方面有所不同:
+1. =awaitNanos(nanosTimeout)= return 的是 =deadline= 和當前 =System.nanoTime()= 的差值
+2. =awaitNanos(nanosTimeout)= 一般用於實現其他工具類, 服務的對象是其他基於 AQS 技術的其他工具類; 而 =await(time, unit)= 用於支持 =Condition= interface 方法, 服務的對象是依賴 =Condition= 的代碼或開發人員。
+#+begin_src java
+    public final long awaitNanos(long nanosTimeout)
+            throws InterruptedException {
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        Node node = addConditionWaiter();
+        int savedState = fullyRelease(node);
+        final long deadline = System.nanoTime() + nanosTimeout;
+        int interruptMode = 0;
+        while (!isOnSyncQueue(node)) {
+            if (nanosTimeout <= 0L) {
+                transferAfterCancelledWait(node);
+                break;
+            }
+            if (nanosTimeout >= spinForTimeoutThreshold)
+                LockSupport.parkNanos(this, nanosTimeout);
+            if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+                break;
+            nanosTimeout = deadline - System.nanoTime();
+        }
+        if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+            interruptMode = REINTERRUPT;
+        if (node.nextWaiter != null)
+            unlinkCancelledWaiters();
+        if (interruptMode != 0)
+            reportInterruptAfterWait(interruptMode);
+        return deadline - System.nanoTime();
+    }
+
+#+end_src
+** awaitUntil(deadline)
+等待直到 deadline 為止的 await 方法。 同樣的, 如果因 deadline 達到而離開 condition queue, 會正常進入 sync queue, 在實現上只有一點不同: 調用 =LockSupport.parkUntil(this, abstime)= 進行 park
+#+begin_src java
+    /**
+     * Implements absolute timed condition wait.
+     * <ol>
+     * <li> If current thread is interrupted, throw InterruptedException.
+     * <li> Save lock state returned by {@link #getState}.
+     * <li> Invoke {@link #release} with saved state as argument,
+     *      throwing IllegalMonitorStateException if it fails.
+     * <li> Block until signalled, interrupted, or timed out.
+     * <li> Reacquire by invoking specialized version of
+     *      {@link #acquire} with saved state as argument.
+     * <li> If interrupted while blocked in step 4, throw InterruptedException.
+     * <li> If timed out while blocked in step 4, return false, else true.
+     * </ol>
+     */
+    public final boolean awaitUntil(Date deadline)
+            throws InterruptedException {
+        long abstime = deadline.getTime();
+        if (Thread.interrupted())
+            throw new InterruptedException();
+        Node node = addConditionWaiter();
+        int savedState = fullyRelease(node);
+        boolean timedout = false;
+        int interruptMode = 0;
+        while (!isOnSyncQueue(node)) {
+            if (System.currentTimeMillis() > abstime) {
+                timedout = transferAfterCancelledWait(node);
+                break;
+            }
+            LockSupport.parkUntil(this, abstime);
+            if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
+                break;
+        }
+        if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
+            interruptMode = REINTERRUPT;
+        if (node.nextWaiter != null)
+            unlinkCancelledWaiters();
+        if (interruptMode != 0)
+            reportInterruptAfterWait(interruptMode);
+        return !timedout;
+    }
+#+end_src
+* signal 系列方法
+能夠執行 signal 系列方法有一個重要的前提: 該線程處於 =try= acquire 成功的狀態, 正在臨界區內已經執行完畢臨界區代碼, 並且準備離開臨界區。 很重要的一點是, 這個線程是滿足 condition 條件的, 當這個線程要 release 前, 要發出一個 signal/signalAll 告知 condition queue 中的 =node= 可以重新進入 sync queue 中。
+signal 系列方法有 =signal()= 和 =signalAll()= 兩種, 分別對應 =notify()= 和 =notifyAll()=, 也就是只放行一個處在 condition queue 中的 =node= 重新回到 =sync=, 還是要一次性放行所有在該 condition queue 的 =node= 都重新回到 sync queue 中。
+** signal 與 signalAll
+從實現的角度來說, =signal()= 和 =signalAll()= 有以下相同之處:
+1. 都先檢查當前 thread 是否是 AQS sync queue 的 *exclusive* 的擁有者
+2. 如果不是, 立刻 throw =IllegalMonitorStateException=
+3. 如果是, 執行 =doSignal()= 或 =doSignalAll()=
+也就是說, 兩種方法只有在調用不同的 =doSignal()= 和 =doSignalAll()= 而有所差異。
+
+以下我們並列對比 =signal()= 和 =signalAll()=:
+#+begin_src java
+    public final void signal() {
+        if (!isHeldExclusively())
+            throw new IllegalMonitorStateException();
+        Node first = firstWaiter;
+        if (first != null)
+            doSignal(first);
+    }
+
+    public final void signalAll() {
+        if (!isHeldExclusively())
+            throw new IllegalMonitorStateException();
+        Node first = firstWaiter;
+        if (first != null)
+            doSignalAll(first);
+    }
+#+end_src
+** isHeldExclusively()
+=isHeldExclusively()= 是一個 template hook method, 應由 subclass 實現。 該方法的 return 表示該 thread 是否是以 *exclusive* 模式 *持有* sync queue 的 thread, 請注意 doc 的部份: /Returns {@code true} if synchronization is held exclusively with respect to the current (calling) thread./
+#+begin_src java
+    /**
+     * Returns {@code true} if synchronization is held exclusively with
+     * respect to the current (calling) thread.  This method is invoked
+     * upon each call to a non-waiting {@link ConditionObject} method.
+     * (Waiting methods instead invoke {@link #release}.)
+     *
+     * <p>The default implementation throws {@link
+     * UnsupportedOperationException}. This method is invoked
+     * internally only within {@link ConditionObject} methods, so need
+     * not be defined if conditions are not used.
+     *
+     * @return {@code true} if synchronization is held exclusively;
+     *         {@code false} otherwise
+     * @throws UnsupportedOperationException if conditions are not supported
+     */
+    protected boolean isHeldExclusively() {
+        throw new UnsupportedOperationException();
+    }
+#+end_src
+** doSignal()
+=doSignal()= 是由 =signal()= 調用, 是構成 =signal()= 與 =signalAll()= 真正有差異的部份。 當 =doSignal()= 調用, 會確保 *一個* 在 condition queue 中 *沒有被 cancelled* 的 =node= 被 transfer 回到 sync queue 中。
+#+begin_src java
+    /**
+     * Removes and transfers nodes until hit non-cancelled one or
+     * null. Split out from signal in part to encourage compilers
+     * to inline the case of no waiters.
+     * @param first (non-null) the first node on condition queue
+     */
+    private void doSignal(Node first) {
+        do {
+            if ( (firstWaiter = first.nextWaiter) == null)
+                lastWaiter = null;
+            first.nextWaiter = null;
+        } while (!transferForSignal(first) &&
+                 (first = firstWaiter) != null);
+    }
+#+end_src
+注意其中實現的細節:
+1. =first= 用於保存我們當前 condition queue 的 =firstWaiter=, 它馬上會被移出 condition queue 而過期
+2. 第一個 =if= 先執行 =(firstWaiter = first.nextWaiter)=, 將 =firstWaiter= 更新成 condition queue 下一個 =node=
+3. 第一個 =if= 為判斷 =first.nextWaiter= 是否為 =null=
+   這一步如果成立, 代表將原本的 =first= 移出後, condition queue 就為空的, 所以 =firstWaiter= 和 =lastWaiter= 都應指向 =null=
+4. =do...while=
+   注意, 這裡是對 =first= 執行 transfer, 也就是剛剛過期而被移出 condition queue 的 =firstWaiter=, [[transferForSignal(node)][transferForSignal(first)]] 只有在 =first= 成功 transfer 到 sync 中, 才會 return =true=, 所以:
+   * 如果 transfer 成功, =do...while= 結束
+     這種情況表示此次 transfer 成功, 已經確保一個沒有被 cancelled 的 =first= 成功 transfer 回 sync queue 中
+   * 如果 transfer 失敗, 會立刻更新 =first= 成最新、沒過期的 =firstWaiter=, 並檢查這次失敗是否由 =firstWaiter= 為 =null= 造成的:
+     * 該失敗是由 =firstWaiter= 為 =null= 造成的, 則 =do...while= 結束
+       注意, 這種失敗發生在是由於第一個 =if= 成立後, 此時 =firstWaiter= 是 =null=, 因此不需要有 =node= 需要 transfer 回 sync queue
+     * 該失敗是由 =firstWaiter= 為 =null= 造成的, 則 =do...while= 繼續
+       這代表 =node= transfer 失敗, 但這是由於 =node= 是被 cancelled 造成的, =do...while= 應繼續
+** doSignalAll()
+=doSignalAll()= 的邏輯比 =doSignal()= 簡單很多, 因為 =doSignalAll= 是將整個 condition queue 中所有沒被 cancelled 的 =node= transfer 回 sync queue
+#+begin_src java
+    /**
+     * Removes and transfers all nodes.
+     * @param first (non-null) the first node on condition queue
+     */
+    private void doSignalAll(Node first) {
+        lastWaiter = firstWaiter = null;
+        do {
+            Node next = first.nextWaiter;
+            first.nextWaiter = null;
+            transferForSignal(first);
+            first = next;
+        } while (first != null);
+    }
+#+end_src
+* Condition Object 總結
+** 導致 sync queue 的響應策略切換
+ * 回到 sync queue 後, 再次被 interrupt 一律推遲響應
+   await 系列方法再次回到 sync queue 之後, 如果有再次被 interrupt 一律推遲響應
+   注意, 所有的 await 系列方法在回到 sync queue 後, 會先檢查 await 過程中是否收到 interrupt, 如果有的話立刻依照 await 的響應策略進行響應; 在這次檢查之後, 在 sync queue 中的響應策略一律是推遲響應, 因為每一種 await 方法都是以 =acquireQueued= 來完成自旋。
+ * 可能導致 interrupt 響應策略被切換
+   await 系列方法有不同 interrupt 響應策略, 也有支持 timeout 功能的版本, 這些功能都是面向在 condition queue 中的等待; 當這些條件被滿足而要離開 condition queue, 會重新回到 sync queue 中以推遲響應 interrupt 的方式自旋, 而非原來在 sync queue 的響應策略。
+** await/signal 的使用前提
+注意我們強調了 await/signal 方法的使用前提
+ * 調用 await 方法時:
+   1. 已經 =tryAcquire= 成功, thread 正在持有 sync queue, 準備要執行臨界代碼
+   2. 但因 condition 沒滿足, 而不能執行臨界代碼, 需要完全讓出所有權
+   3. 離開 sync queue 後, 要進入 condition queue 等待
+   4. 被喚醒, 根據是 signal/interrupt 來決定是否離開 condition queue 進入 sync queue, 或是以 await 的 interrupt 響應策略做響應
+ * 調用 signal 方法時:
+   1. 已經 =tryAcquire= 成功, thread 正在持有 sync queue, 已經執行完臨界代碼, 準備離開臨界區
+   2. 要以 signal/signalAll 通知 condition queue 的 =node= 重新回到 sync queue 中等待
+** Node 的轉移
+實際上 =node= 可能會發生兩次轉移:
+1. 從 sync queue 中轉移到 condition queue
+   這個過程是透過 =addConditionWaiter= 實現, 過程中創建全新的 =Node= 加入到 condition queue 中
+2. 從 condition queue 轉移到 sync queue
+   這個過程透過 =transferForSignal= 或 =transferAfterCancelledWait= 實現, 過程中復用 condition queue 的 node
+
+注意, =node= 在回到 sync queue 時, =nextWaiter= 會被設為 =null=:
+#+begin_src java
+    private void doSignal(Node first) {
+        do {
+            if ( (firstWaiter = first.nextWaiter) == null)
+                lastWaiter = null;
+            first.nextWaiter = null;
+        } while (!transferForSignal(first) &&
+                 (first = firstWaiter) != null);
+    }
+#+end_src
+** condition object 無法兼容 shared mode
+這是個人目前的看法: 注意, 雖然沒有限制 await/signal 方法不能以 shared 下的 acquire/release 一起工作, 但是由於 await/signal 對 sync queue 狀態的約束, 以及回到 sync queue 後的自旋方式, 都讓 condition queue 無法兼容 shared 下的 acquire/release 方法。
+
+之所以這樣的看法有以下觀察:
+1. 在進入 condition queue 時, =node.nextWaiter= 的資訊沒有被保留過
+   在進入 condition queue 後是會以全新的 =Node= 替代該 =node=, 其中調用的是 [[addConditionWaiter()][addConditionWaiter]], 原始 =node.nextWaiter= 的資訊沒有被保留過, 而這個資訊在 sync queue 中原本用於保存 =node.EXCLUSIVE= 或 =node.SHARED=
+2. 沒有 =fullyReleaseShared(arg)= 的實現
+   shared 下 release 需要被 propagte, 所以如果 condition queue 要支持 shared, 至少要保證進 condition queue 的過程也要被 propagte
+3. 回到 sync queue 後, 無法以 =doAcquireShared= 方法自旋
+   回到 sync queue 後, 會採取 =acquireQueued= 方法自旋, 這個方法是 exclusive 下的 acquire 自旋策略
+4. 根據 [[doSignal()][doSignal()]] 的實現, 回到 sync queue 後 =nextWaiter= 會被設為 =null=
+   當 =node= 在 sync queue 中, =nextWaiter= 為 =null= 表示的是 =EXCLUSIVE=
+5. 在閱讀 =ReentrantReadWriteLock= 時, 發現 =ReedLock= 的 condition object 是被禁止使用的
+
+從 exclusive 的 =acquire(arg)=, =release(arg)= 以及 condition object 方法的實現結構與風格來看, 他們是一致的: 真正自旋的方法是 =acquireQueued=, 並且將 =add= 方法職責交給 =addWaiter= 和 =addConditionWaiter=, 而不是向其他 =do acquire= 方法一樣包含了 =add= 的職責, 這或許是 exclusive 下 acquire/release 方法最終選擇不重構的主因。
